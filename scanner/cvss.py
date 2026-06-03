@@ -8,27 +8,27 @@ class CVSSVector(Enum):
     """CVSS v3.1 metric enumerations."""
     
     # Attack Vector
-    NETWORK = 0.85
-    ADJACENT = 0.62
-    LOCAL = 0.55
-    PHYSICAL = 0.2
+    AV_NETWORK = 0.85
+    AV_ADJACENT = 0.62
+    AV_LOCAL = 0.55
+    AV_PHYSICAL = 0.2
     
     # Attack Complexity
-    LOW = 0.77
-    HIGH = 0.44
+    AC_LOW = 0.77
+    AC_HIGH = 0.44
     
     # Privileges Required
-    NONE = 0.85
-    LOW = 0.62
-    HIGH = 0.27
+    PR_NONE = 0.85
+    PR_LOW = 0.62
+    PR_HIGH = 0.27
     
     # User Interaction
-    NONE = 0.85
-    REQUIRED = 0.62
+    UI_NONE = 0.85
+    UI_REQUIRED = 0.62
     
     # Scope
-    UNCHANGED = 1.0
-    CHANGED = 1.08
+    S_UNCHANGED = 1.0
+    S_CHANGED = 1.08
 
 
 def calculate_cvss_score(
