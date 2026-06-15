@@ -1,280 +1,276 @@
-"""Flask web application for CyberScan vulnerability detection engine."""
+"""CyberX – Flask API server. Full OWASP Top 10 scanner."""
 
 import os
-import json
 import threading
+import time
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, send_file
 from pathlib import Path
 
-from scanner.sql_injection import scan_sqli
-from scanner.xss import scan_reflected_xss
-from scanner.batch import BatchScanner
+from flask import Flask, render_template, request, jsonify, send_file
+from scanner.owasp_scanner import OWASPScanner
 from scanner.config import ScannerConfig
 from scanner.report import ScanResult, ScanReportGenerator
 from scanner.logger import setup_logger
-from scanner.owasp_scanner import OWASPScanner
-import time
 
-# Initialize Flask app
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 logger = setup_logger(__name__, level='INFO')
 
-# Store active scans for progress tracking
-active_scans = {}
+# ── simple in-memory scan store (swap for Redis in prod) ─────────────
+active_scans: dict = {}
 REPORTS_DIR = Path('reports')
 REPORTS_DIR.mkdir(exist_ok=True)
 
+# ── optional API-key auth (set CYBERX_API_KEY env var to enable) ─────
+API_KEY = os.environ.get('CYBERX_API_KEY', '')
+
+
+def _check_api_key():
+    if not API_KEY:
+        return None  # auth disabled
+    key = request.headers.get('X-API-Key', '')
+    if key != API_KEY:
+        return jsonify({'error': 'Unauthorized – provide X-API-Key header'}), 401
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    """Render main scan interface."""
     return render_template('index.html')
+
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'version': '2.0.0'}), 200
 
 
 @app.route('/api/scan', methods=['POST'])
 def api_scan():
-    """API endpoint for starting a scan."""
+    denied = _check_api_key()
+    if denied:
+        return denied
+
     try:
-        data = request.get_json()
-        
-        # Validate input
+        data = request.get_json(force=True) or {}
+
         urls = data.get('urls', [])
-        scan_type = data.get('scan_type', 'all')
-        timeout = data.get('timeout', 5)
-        aggressive = data.get('aggressive', False)
-        stealth = data.get('stealth', False)
-        
-        if not urls:
-            return jsonify({'error': 'No URLs provided'}), 400
-        
         if isinstance(urls, str):
-            urls = [urls]
-        
+            urls = [u.strip() for u in urls.splitlines()]
         urls = [u.strip() for u in urls if u.strip()]
-        
         if not urls:
             return jsonify({'error': 'No valid URLs provided'}), 400
-        
-        # Configure scanner
-        if aggressive:
-            config = ScannerConfig.get_aggressive()
-        elif stealth:
-            config = ScannerConfig.get_stealth()
-        else:
-            config = ScannerConfig.get_default()
-        
-        config.request_timeout = timeout
-        
-        # Generate scan ID
+
+        timeout  = int(data.get('timeout', 7))
+        mode     = data.get('mode', 'default')   # default | aggressive | stealth
+
+        # Auth material for authenticated scans
+        auth_headers = data.get('auth_headers', {})
+        auth_cookies = data.get('auth_cookies', {})
+        # Convenience: accept a single "Authorization" Bearer token
+        bearer = data.get('bearer_token', '')
+        if bearer:
+            auth_headers['Authorization'] = f'Bearer {bearer}'
+        session_cookie = data.get('session_cookie', '')
+        if session_cookie:
+            auth_cookies['session'] = session_cookie
+
         scan_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        
-        # Store scan info
         active_scans[scan_id] = {
-            'status': 'running',
-            'progress': 0,
-            'urls_count': len(urls),
-            'completed': 0,
-            'current_test': 'Initializing...',
+            'status':       'running',
+            'progress':     0,
+            'urls_count':   len(urls),
+            'completed':    0,
+            'current_test': 'Initialising…',
             'test_progress': [],
-            'results': [],
-            'started': datetime.now().isoformat()
+            'results':      [],
+            'started':      datetime.now().isoformat(),
         }
-        
-        # Start scan in background thread
+
         thread = threading.Thread(
             target=_run_scan,
-            args=(scan_id, urls, scan_type, config)
+            args=(scan_id, urls, timeout, mode, auth_headers, auth_cookies),
+            daemon=True,
         )
-        thread.daemon = True
         thread.start()
-        
+
         return jsonify({'scan_id': scan_id, 'urls_count': len(urls)}), 202
-    
-    except Exception as e:
-        logger.error(f"Error starting scan: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+
+    except Exception as exc:
+        logger.error(f'Error starting scan: {exc}')
+        return jsonify({'error': str(exc)}), 500
 
 
-@app.route('/api/scan/<scan_id>/status', methods=['GET'])
+@app.route('/api/scan/<scan_id>/status')
 def api_scan_status(scan_id):
-    """Get scan progress and status."""
-    if scan_id not in active_scans:
+    denied = _check_api_key()
+    if denied:
+        return denied
+
+    info = active_scans.get(scan_id)
+    if not info:
         return jsonify({'error': 'Scan not found'}), 404
-    
-    scan_info = active_scans[scan_id]
-    
+
+    vulns_found = sum(1 for r in info['results'] if r.vulnerability_found)
     return jsonify({
-        'scan_id': scan_id,
-        'status': scan_info['status'],
-        'progress': scan_info['progress'],
-        'urls_count': scan_info['urls_count'],
-        'completed': scan_info['completed'],
-        'current_test': scan_info.get('current_test', ''),
-        'test_progress': scan_info.get('test_progress', []),
-        'vulnerabilities_found': sum(
-            1 for r in scan_info['results'] if r.get('vulnerability_found', False)
-        )
+        'scan_id':           scan_id,
+        'status':            info['status'],
+        'progress':          info['progress'],
+        'urls_count':        info['urls_count'],
+        'completed':         info['completed'],
+        'current_test':      info.get('current_test', ''),
+        'test_progress':     info.get('test_progress', []),
+        'vulnerabilities_found': vulns_found,
     }), 200
 
 
-@app.route('/api/scan/<scan_id>/results', methods=['GET'])
+@app.route('/api/scan/<scan_id>/results')
 def api_scan_results(scan_id):
-    """Get scan results."""
-    if scan_id not in active_scans:
+    denied = _check_api_key()
+    if denied:
+        return denied
+
+    info = active_scans.get(scan_id)
+    if not info:
         return jsonify({'error': 'Scan not found'}), 404
-    
-    scan_info = active_scans[scan_id]
-    
-    if scan_info['status'] != 'completed':
+    if info['status'] != 'completed':
         return jsonify({'error': 'Scan still in progress'}), 202
-    
-    results = [r.to_dict() for r in scan_info['results']]
-    
+
+    results = [r.to_dict() for r in info['results']]
     return jsonify({
         'scan_id': scan_id,
         'results': results,
         'summary': {
-            'total_scans': len(results),
-            'vulnerabilities_found': sum(1 for r in results if r['vulnerability_found']),
-            'critical_high': sum(
-                1 for r in results if r['severity'] in ['CRITICAL', 'HIGH']
-            )
-        }
+            'total_findings':   len(results),
+            'critical': sum(1 for r in results if r['severity'] == 'CRITICAL'),
+            'high':     sum(1 for r in results if r['severity'] == 'HIGH'),
+            'medium':   sum(1 for r in results if r['severity'] == 'MEDIUM'),
+            'low':      sum(1 for r in results if r['severity'] == 'LOW'),
+        },
     }), 200
 
 
-@app.route('/api/report/<scan_id>/<format>', methods=['GET'])
-def api_download_report(scan_id, format):
-    """Download report in specified format."""
-    if scan_id not in active_scans:
+@app.route('/api/report/<scan_id>/<fmt>')
+def api_download_report(scan_id, fmt):
+    denied = _check_api_key()
+    if denied:
+        return denied
+
+    info = active_scans.get(scan_id)
+    if not info:
         return jsonify({'error': 'Scan not found'}), 404
-    
-    scan_info = active_scans[scan_id]
-    results = scan_info['results']
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
+    if info['status'] != 'completed':
+        return jsonify({'error': 'Scan still in progress'}), 202
+
+    results = info['results']
+    if not results:
+        return jsonify({'error': 'No results'}), 404
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     try:
-        if format == 'html':
-            filepath = REPORTS_DIR / f'report_{scan_id}.html'
-            ScanReportGenerator.to_html(results, str(filepath))
-            return send_file(
-                str(filepath),
-                mimetype='text/html',
-                as_attachment=True,
-                download_name=f'cyberscan_report_{timestamp}.html'
-            )
-        
-        elif format == 'json':
-            filepath = REPORTS_DIR / f'report_{scan_id}.json'
-            json_str = ScanReportGenerator.to_json(results, str(filepath))
-            return send_file(
-                str(filepath),
-                mimetype='application/json',
-                as_attachment=True,
-                download_name=f'cyberscan_report_{timestamp}.json'
-            )
-        
-        elif format == 'csv':
-            filepath = REPORTS_DIR / f'report_{scan_id}.csv'
-            ScanReportGenerator.to_csv(results, str(filepath))
-            return send_file(
-                str(filepath),
-                mimetype='text/csv',
-                as_attachment=True,
-                download_name=f'cyberscan_report_{timestamp}.csv'
-            )
-        
+        if fmt == 'html':
+            fp = REPORTS_DIR / f'report_{scan_id}.html'
+            ScanReportGenerator.to_html(results, str(fp))
+            return send_file(str(fp), mimetype='text/html', as_attachment=True,
+                             download_name=f'cyberx_report_{ts}.html')
+        elif fmt == 'json':
+            fp = REPORTS_DIR / f'report_{scan_id}.json'
+            ScanReportGenerator.to_json(results, str(fp))
+            return send_file(str(fp), mimetype='application/json', as_attachment=True,
+                             download_name=f'cyberx_report_{ts}.json')
+        elif fmt == 'csv':
+            fp = REPORTS_DIR / f'report_{scan_id}.csv'
+            ScanReportGenerator.to_csv(results, str(fp))
+            return send_file(str(fp), mimetype='text/csv', as_attachment=True,
+                             download_name=f'cyberx_report_{ts}.csv')
         else:
-            return jsonify({'error': 'Invalid format'}), 400
-    
-    except Exception as e:
-        logger.error(f"Error generating report: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+            return jsonify({'error': 'Use html, json, or csv'}), 400
+    except Exception as exc:
+        logger.error(f'Report error: {exc}')
+        return jsonify({'error': str(exc)}), 500
 
 
-def _run_scan(scan_id, urls, scan_type, config):
-    """Background scan worker using OWASP Top 10 scanner."""
+# ─────────────────────────────────────────────────────────────────────
+# Background worker
+# ─────────────────────────────────────────────────────────────────────
+
+def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
     try:
-        logger.info(f"Starting OWASP scan {scan_id} on {len(urls)} URLs")
-        
-        # Initialize OWASP scanner
-        scanner = OWASPScanner(timeout=config.request_timeout)
+        logger.info(f'Scan {scan_id} starting – {len(urls)} URL(s), mode={mode}')
+
+        scanner = OWASPScanner(
+            timeout=timeout,
+            auth_headers=auth_headers,
+            auth_cookies=auth_cookies,
+        )
+
         all_results = []
-        
-        # Process each URL
+
+        def _cb(msg):
+            active_scans[scan_id]['current_test'] = msg
+            prog = active_scans[scan_id]['test_progress']
+            if msg not in prog:
+                prog.append(msg)
+            active_scans[scan_id]['test_progress'] = prog[-12:]
+
+        scanner.set_progress_callback(_cb)
+
         for idx, url in enumerate(urls):
-            def progress_callback(message):
-                """Update progress with current test."""
-                active_scans[scan_id]['current_test'] = message
-                if message not in active_scans[scan_id]['test_progress']:
-                    active_scans[scan_id]['test_progress'].append(message)
-                active_scans[scan_id]['test_progress'] = active_scans[scan_id]['test_progress'][-10:]  # Keep last 10
-            
-            scanner.set_progress_callback(progress_callback)
-            
-            # Simulate realistic scan time with delays between tests
-            active_scans[scan_id]['current_test'] = f"Scanning: {url}"
-            
+            active_scans[scan_id]['current_test'] = f'Scanning: {url}'
             try:
-                # Run OWASP comprehensive scan
-                scan_result = scanner.scan_url(url)
-                
-                # Convert to result format
-                for vuln in scan_result.get('vulnerabilities', []):
-                    result = {
-                        'url': url,
-                        'owasp_category': vuln.get('owasp_category', 'Unknown'),
-                        'vulnerability_type': vuln.get('type', 'Unknown'),
-                        'severity': vuln.get('severity', 'MEDIUM'),
-                        'description': vuln.get('description', ''),
-                        'cvss_score': vuln.get('cvss_score', 0),
-                        'vulnerability_found': vuln.get('severity') != 'INFO'
-                    }
-                    all_results.append(result)
-                
-                # Add scan timing
-                time.sleep(0.5)  # Realistic scan delay
-                
-            except Exception as e:
-                logger.error(f"Error scanning {url}: {str(e)}")
-                all_results.append({
-                    'url': url,
-                    'owasp_category': 'Scan Error',
-                    'vulnerability_type': 'Scanner Error',
-                    'severity': 'MEDIUM',
-                    'description': str(e),
-                    'cvss_score': 0,
-                    'vulnerability_found': False
-                })
-            
-            # Update progress
+                raw = scanner.scan_url(url)
+                for v in raw.get('vulnerabilities', []):
+                    sev = v.get('severity', 'MEDIUM')
+                    all_results.append(ScanResult(
+                        scan_type=v.get('type', 'Unknown'),
+                        target_url=v.get('url', url) or url,
+                        vulnerability_found=sev not in ('INFO',),
+                        severity=sev,
+                        details=v.get('description', ''),
+                        cvss_score=float(v.get('cvss_score', 0.0)),
+                        scan_duration=0.0,
+                        owasp_category=v.get('owasp_category', ''),
+                        evidence=v.get('evidence', ''),
+                    ))
+                # brief pause between URLs to be polite
+                time.sleep(0.3)
+            except Exception as exc:
+                logger.error(f'Error scanning {url}: {exc}')
+                all_results.append(ScanResult(
+                    scan_type='Scanner Error',
+                    target_url=url,
+                    vulnerability_found=False,
+                    severity='MEDIUM',
+                    details=str(exc),
+                    cvss_score=0.0,
+                    scan_duration=0.0,
+                    owasp_category='Error',
+                ))
+
             active_scans[scan_id]['completed'] = idx + 1
             active_scans[scan_id]['progress'] = int((idx + 1) / len(urls) * 100)
-        
-        # Store results
-        active_scans[scan_id]['results'] = all_results
-        active_scans[scan_id]['status'] = 'completed'
-        active_scans[scan_id]['progress'] = 100
-        active_scans[scan_id]['current_test'] = 'Scan Complete ✓'
-        
-        logger.info(f"Scan {scan_id} completed with {len(all_results)} findings")
-    
-    except Exception as e:
-        logger.error(f"Error in scan {scan_id}: {str(e)}")
-        active_scans[scan_id]['status'] = 'error'
-        active_scans[scan_id]['error'] = str(e)
-        active_scans[scan_id]['current_test'] = f'Error: {str(e)}'
 
+        active_scans[scan_id].update({
+            'results':      all_results,
+            'status':       'completed',
+            'progress':     100,
+            'current_test': 'Scan complete ✓',
+        })
+        logger.info(f'Scan {scan_id} done – {len(all_results)} findings')
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint."""
-    return jsonify({'status': 'healthy', 'version': '1.0.0'}), 200
+    except Exception as exc:
+        logger.error(f'Fatal scan error {scan_id}: {exc}')
+        active_scans[scan_id].update({
+            'status':       'error',
+            'error':        str(exc),
+            'current_test': f'Error: {exc}',
+        })
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(debug=debug, host='0.0.0.0', port=5000)

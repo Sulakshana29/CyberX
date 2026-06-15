@@ -1,4 +1,4 @@
-"""Scan result management and reporting for CyberScan."""
+"""Scan result management and multi-format reporting for CyberX."""
 
 import json
 import csv
@@ -8,195 +8,155 @@ from typing import List, Dict, Optional
 
 
 class ScanResult:
-    """Represents a single vulnerability scan result.
+    """One vulnerability finding."""
 
-    Attributes:
-        scan_type:          Type of scan (SQL_INJECTION, REFLECTED_XSS, …).
-        target_url:         Target URL that was scanned.
-        vulnerability_found: Whether a vulnerability was detected.
-        severity:           Severity level (CRITICAL/HIGH/MEDIUM/LOW/Info/Error).
-        cvss_score:         CVSS v3.1 score (0–10).
-        details:            Detailed description of findings.
-        timestamp:          When the scan was performed.
-        scan_duration:      Duration of scan in seconds.
-    """
-
-    def __init__(
-        self,
-        scan_type: str,
-        target_url: str,
-        vulnerability_found: bool,
-        severity: str,
-        details: str,
-        cvss_score: float = 0.0,
-        scan_duration: float = 0.0,
-    ):
-        self.scan_type = scan_type
-        self.target_url = target_url
+    def __init__(self, scan_type: str, target_url: str, vulnerability_found: bool,
+                 severity: str, details: str, cvss_score: float = 0.0,
+                 scan_duration: float = 0.0, owasp_category: str = '',
+                 evidence: str = ''):
+        self.scan_type          = scan_type
+        self.target_url         = target_url
         self.vulnerability_found = vulnerability_found
-        self.severity = severity
-        self.cvss_score = cvss_score
-        self.details = details
-        self.timestamp = datetime.now()
-        self.scan_duration = scan_duration   # seconds (float)
+        self.severity           = severity
+        self.cvss_score         = cvss_score
+        self.details            = details
+        self.evidence           = evidence
+        self.timestamp          = datetime.now()
+        self.scan_duration      = scan_duration
+        self.owasp_category     = owasp_category
 
     def to_dict(self) -> Dict:
-        """Convert result to dictionary."""
         return {
-            'scan_type': self.scan_type,
-            'target_url': self.target_url,
-            'vulnerability_found': self.vulnerability_found,
-            'severity': self.severity,
-            'cvss_score': self.cvss_score,
-            'details': self.details,
-            'timestamp': self.timestamp.isoformat(),
+            'owasp_category':       self.owasp_category,
+            'scan_type':            self.scan_type,
+            'target_url':           self.target_url,
+            'vulnerability_found':  self.vulnerability_found,
+            'severity':             self.severity,
+            'cvss_score':           self.cvss_score,
+            'details':              self.details,
+            'evidence':             self.evidence,
+            'timestamp':            self.timestamp.isoformat(),
             'scan_duration_seconds': round(self.scan_duration, 3),
         }
 
 
 class ScanReportGenerator:
-    """Generate vulnerability scan reports in multiple formats."""
+    """Generate vulnerability reports as HTML / JSON / CSV."""
 
+    # ------------------------------------------------------------------ JSON
     @staticmethod
     def to_json(results: List[ScanResult], filepath: Optional[str] = None) -> str:
-        """Export scan results to JSON format."""
         report = {
-            'scan_timestamp': datetime.now().isoformat(),
-            'total_scans': len(results),
-            'vulnerabilities_found': sum(1 for r in results if r.vulnerability_found),
-            'results': [r.to_dict() for r in results],
+            'generator':    'CyberX v2.0',
+            'generated_at': datetime.now().isoformat(),
+            'total':        len(results),
+            'critical':     sum(1 for r in results if r.severity == 'CRITICAL'),
+            'high':         sum(1 for r in results if r.severity == 'HIGH'),
+            'medium':       sum(1 for r in results if r.severity == 'MEDIUM'),
+            'low':          sum(1 for r in results if r.severity == 'LOW'),
+            'results':      [r.to_dict() for r in results],
         }
-        json_str = json.dumps(report, indent=2)
+        out = json.dumps(report, indent=2)
         if filepath:
-            Path(filepath).write_text(json_str)
-        return json_str
+            Path(filepath).write_text(out)
+        return out
 
+    # ------------------------------------------------------------------ CSV
     @staticmethod
     def to_csv(results: List[ScanResult], filepath: str) -> None:
-        """Export scan results to CSV format."""
         if not results:
             return
-        with open(filepath, 'w', newline='') as f:
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=results[0].to_dict().keys())
             writer.writeheader()
-            for result in results:
-                writer.writerow(result.to_dict())
+            for r in results:
+                writer.writerow(r.to_dict())
 
+    # ------------------------------------------------------------------ HTML
     @staticmethod
     def to_html(results: List[ScanResult], filepath: str) -> None:
-        """Export scan results to HTML format with styling."""
-        vulnerability_count = sum(1 for r in results if r.vulnerability_found)
-
-        severity_colors = {
-            'CRITICAL': '#d9534f',
-            'HIGH':     '#ec971f',
-            'MEDIUM':   '#f0ad4e',
-            'LOW':      '#5bc0de',
-            'Info':     '#5bc0de',
-            'Error':    '#d9534f',
+        sev_color = {
+            'CRITICAL': '#dc2626', 'HIGH': '#ea580c',
+            'MEDIUM':   '#d97706', 'LOW':  '#2563eb',
+        }
+        sev_bg = {
+            'CRITICAL': '#fee2e2', 'HIGH': '#ffedd5',
+            'MEDIUM':   '#fef3c7', 'LOW':  '#dbeafe',
         }
 
-        html_content = f"""<!DOCTYPE html>
+        total    = len(results)
+        critical = sum(1 for r in results if r.severity == 'CRITICAL')
+        high     = sum(1 for r in results if r.severity == 'HIGH')
+        medium   = sum(1 for r in results if r.severity == 'MEDIUM')
+        low      = sum(1 for r in results if r.severity == 'LOW')
+
+        rows = ''
+        for r in results:
+            color = sev_color.get(r.severity, '#6b7280')
+            bg    = sev_bg.get(r.severity, '#f3f4f6')
+            rows += f"""
+            <tr style="background:{bg}10;">
+              <td style="font-weight:600;color:#1e293b;">{r.owasp_category}</td>
+              <td>{r.scan_type}</td>
+              <td style="font-family:monospace;font-size:12px;color:#475569;">{r.target_url[:80]}</td>
+              <td><span class="badge" style="background:{color};">{r.severity}</span></td>
+              <td style="font-weight:700;color:{color};">{r.cvss_score}</td>
+              <td style="font-size:13px;">{r.details}</td>
+              <td style="font-family:monospace;font-size:11px;color:#64748b;">{r.evidence[:60]}</td>
+            </tr>"""
+
+        html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CyberScan - Vulnerability Report</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: #f5f5f5; padding: 20px; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background: white;
-                      padding: 30px; border-radius: 8px;
-                      box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #333; margin-bottom: 10px; }}
-        .summary {{ display: grid; grid-template-columns: repeat(4, 1fr);
-                    gap: 20px; margin-bottom: 30px; }}
-        .summary-card {{ color: white; padding: 20px; border-radius: 8px;
-                         text-align: center; }}
-        .summary-card h3 {{ font-size: 28px; margin: 10px 0; }}
-        .summary-card p {{ opacity: 0.9; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-        th {{ background: #333; color: white; padding: 12px; text-align: left;
-              font-weight: 600; }}
-        td {{ padding: 12px; border-bottom: 1px solid #ddd; }}
-        tr:hover {{ background: #f9f9f9; }}
-        .badge {{ display: inline-block; padding: 6px 12px; border-radius: 4px;
-                  color: white; font-weight: 600; }}
-        .vuln-found     {{ background: #d9534f; }}
-        .vuln-not-found {{ background: #5cb85c; }}
-        .timestamp {{ color: #666; font-size: 14px; margin-top: 20px;
-                      border-top: 1px solid #ddd; padding-top: 20px; }}
-        code {{ background: #f4f4f4; padding: 2px 4px; border-radius: 3px;
-                font-size: 13px; word-break: break-all; }}
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CyberX Security Report</title>
+  <style>
+    *{{margin:0;padding:0;box-sizing:border-box}}
+    body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px}}
+    .wrap{{max-width:1400px;margin:0 auto}}
+    h1{{font-size:28px;font-weight:800;background:linear-gradient(135deg,#38bdf8,#818cf8);
+        -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}}
+    .sub{{color:#64748b;margin-bottom:24px;font-size:14px}}
+    .cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:28px}}
+    .card{{background:#1e293b;border-radius:12px;padding:20px;text-align:center;
+           border:1px solid #334155}}
+    .card .num{{font-size:32px;font-weight:800;margin:6px 0}}
+    .card .lbl{{font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em}}
+    .c-red{{color:#ef4444}}.c-ora{{color:#f97316}}.c-yel{{color:#f59e0b}}.c-blu{{color:#3b82f6}}
+    table{{width:100%;border-collapse:collapse;background:#1e293b;border-radius:12px;
+           overflow:hidden;border:1px solid #334155}}
+    thead th{{background:#0f172a;color:#94a3b8;padding:12px 14px;text-align:left;
+              font-size:12px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #334155}}
+    tbody td{{padding:12px 14px;border-bottom:1px solid #1e293b20;vertical-align:top}}
+    tbody tr:hover td{{background:#ffffff08}}
+    .badge{{display:inline-block;padding:3px 10px;border-radius:999px;color:#fff;
+            font-size:11px;font-weight:700;letter-spacing:.04em}}
+    .footer{{margin-top:24px;color:#475569;font-size:12px;text-align:center}}
+  </style>
 </head>
 <body>
-<div class="container">
-    <h1>🔒 CyberScan Vulnerability Report</h1>
-    <p style="color:#666; margin-bottom:20px;">Automated Security Vulnerability Detection</p>
+<div class="wrap">
+  <h1>🛡 CyberX Security Report</h1>
+  <p class="sub">Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} — OWASP Top 10 (2021)</p>
 
-    <div class="summary">
-        <div class="summary-card"
-             style="background: linear-gradient(135deg,#667eea,#764ba2);">
-            <p>Total Scans</p><h3>{len(results)}</h3>
-        </div>
-        <div class="summary-card"
-             style="background: linear-gradient(135deg,#f093fb,#f5576c);">
-            <p>Vulnerabilities</p><h3>{vulnerability_count}</h3>
-        </div>
-        <div class="summary-card"
-             style="background: linear-gradient(135deg,#4facfe,#00f2fe);">
-            <p>Critical/High</p>
-            <h3>{sum(1 for r in results if r.severity in ('CRITICAL','HIGH'))}</h3>
-        </div>
-        <div class="summary-card"
-             style="background: linear-gradient(135deg,#43e97b,#38f9d7);">
-            <p>Clean</p>
-            <h3>{sum(1 for r in results if not r.vulnerability_found)}</h3>
-        </div>
-    </div>
+  <div class="cards">
+    <div class="card"><div class="lbl">Total Findings</div><div class="num" style="color:#e2e8f0">{total}</div></div>
+    <div class="card"><div class="lbl">Critical</div><div class="num c-red">{critical}</div></div>
+    <div class="card"><div class="lbl">High</div><div class="num c-ora">{high}</div></div>
+    <div class="card"><div class="lbl">Medium / Low</div><div class="num c-yel">{medium + low}</div></div>
+  </div>
 
-    <table>
-        <thead>
-            <tr>
-                <th>Scan Type</th><th>Target URL</th><th>Status</th>
-                <th>Severity</th><th>CVSS</th><th>Details</th><th>Duration</th>
-            </tr>
-        </thead>
-        <tbody>
-"""
+  <table>
+    <thead><tr>
+      <th>OWASP</th><th>Type</th><th>URL</th><th>Severity</th>
+      <th>CVSS</th><th>Description</th><th>Evidence</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
 
-        for result in results:
-            # FIX: use result.scan_duration (the attribute), not scan_duration_seconds
-            # (which only exists on the dict returned by to_dict()).
-            duration_s = round(result.scan_duration, 3)
-            status_class = 'vuln-found' if result.vulnerability_found else 'vuln-not-found'
-            status_text  = '✗ VULNERABLE' if result.vulnerability_found else '✓ CLEAN'
-            sev_color    = severity_colors.get(result.severity, '#5bc0de')
-
-            html_content += f"""
-            <tr>
-                <td><strong>{result.scan_type}</strong></td>
-                <td><code>{result.target_url}</code></td>
-                <td><span class="badge {status_class}">{status_text}</span></td>
-                <td><span class="badge" style="background:{sev_color};">{result.severity}</span></td>
-                <td><strong>{result.cvss_score}</strong></td>
-                <td>{result.details}</td>
-                <td>{duration_s:.3f}s</td>
-            </tr>
-"""
-
-        html_content += f"""
-        </tbody>
-    </table>
-
-    <div class="timestamp">
-        <p><strong>Report Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        <p><strong>CyberScan v1.0</strong> — Production-Grade Vulnerability Detection Engine</p>
-    </div>
+  <div class="footer">CyberX v2.0 — for authorised security testing only</div>
 </div>
 </body>
-</html>
-"""
-        Path(filepath).write_text(html_content)
+</html>"""
+        Path(filepath).write_text(html, encoding='utf-8')

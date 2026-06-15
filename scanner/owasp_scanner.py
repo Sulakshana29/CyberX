@@ -1,572 +1,975 @@
-"""OWASP Top 10 comprehensive vulnerability scanner with WSTG categories."""
+"""
+CyberX – OWASP Top 10 (2021) comprehensive vulnerability scanner.
 
-import requests
-import secrets
+Coverage
+--------
+A01 Broken Access Control        – IDOR, forced-browsing admin paths
+A02 Cryptographic Failures       – HTTP plaintext, invalid TLS cert, weak cipher hints
+A03 Injection                    – SQL injection (GET + POST + headers), Reflected XSS,
+                                   Command injection, LDAP injection, NoSQL injection
+A04 Insecure Design              – Path traversal, Open redirect
+A05 Security Misconfiguration    – Missing headers, server disclosure, dangerous HTTP methods,
+                                   directory listing, debug endpoints
+A06 Vulnerable Components        – Server/framework version extraction + CVE hint
+A07 Auth Failures                – Insecure cookie flags, HTTP Basic over HTTP,
+                                   default credential probing
+A08 Software Integrity Failures  – Missing Subresource Integrity on CDN scripts
+A09 Logging Failures             – Verbose error pages leaking stack traces
+A10 SSRF                         – URL-param injection, AWS metadata, blind SSRF via timing
+
+Next phase: spider/crawl module to auto-discover endpoints.
+"""
+
 import re
+import time
+import secrets
+import requests
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import (
+    urljoin, urlparse, parse_qs, urlencode, urlunparse, quote
+)
+
 from scanner.logger import setup_logger
 from scanner.cvss import calculate_cvss_score
 
 logger = setup_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _vuln(
+    category: str,
+    vtype: str,
+    severity: str,
+    description: str,
+    url: str = '',
+    cvss: float = 0.0,
+    evidence: str = '',
+) -> Dict:
+    """Construct a normalised vulnerability dict."""
+    return {
+        'owasp_category': category,
+        'type': vtype,
+        'severity': severity,
+        'description': description,
+        'url': url,
+        'cvss_score': cvss,
+        'evidence': evidence,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
 
 class OWASPScanner:
-    """Comprehensive OWASP Top 10 vulnerability scanner."""
+    """Full OWASP Top 10 (2021) scanner – GET, POST body, and header injection."""
 
-    # --- A03: SQL Injection ---
-    # Error-based signatures per DBMS (lowercase for case-insensitive match)
-    SQL_ERROR_SIGNATURES = {
+    # ------------------------------------------------------------------ A03 SQL
+    SQL_ERROR_SIGNATURES: Dict[str, List[str]] = {
         'MySQL':      ['you have an error in your sql syntax', 'warning: mysql_',
-                       'mysql_fetch', 'mysql_error', 'mysql_num_rows'],
+                       'mysql_fetch', 'mysql_num_rows', 'supplied argument is not a valid mysql'],
         'PostgreSQL': ['pg_query(): query error', 'error: syntax error at or near',
-                       'pg_connect', 'sqlstate'],
+                       'pg_connect', 'sqlstate', 'unterminated quoted string'],
         'SQLite':     ['operationalerror: near', 'sqlite3.operationalerror',
                        'sqlite error', 'database disk image is malformed'],
         'MSSQL':      ['sql server error', 'incorrect syntax near',
-                       'odbc error', 'adodb.recordset'],
+                       'odbc error', 'adodb.recordset', 'unclosed quotation mark'],
         'Oracle':     ['ora-01756', 'ora-00907', 'oracle error',
                        'quoted string not properly terminated'],
     }
 
-    SQL_INJECTION_PAYLOADS = ["'", '"', "')", '")', "1' OR '1'='1", "' OR 1=1 --"]
+    SQL_PAYLOADS = ["'", '"', "')", '")', "1' OR '1'='1", "' OR 1=1 --",
+                    "' OR 'x'='x", "'; DROP TABLE users; --", "1; SELECT SLEEP(2)--"]
 
-    # --- A03: XSS (canary-based to avoid false positives) ---
-    XSS_VECTOR_TEMPLATES = [
-        "<script>alert('{canary}')</script>",
-        "<img src=x onerror=\"alert('{canary}')\">",
-        "<svg onload=\"alert('{canary}')\">",
-        "'\"><script>alert('{canary}')</script>",
-        '" onfocus="alert(\'{canary}\')" autofocus="',
+    # ------------------------------------------------------------------ A03 XSS
+    XSS_TEMPLATES = [
+        "<script>alert('{c}')</script>",
+        "<img src=x onerror=\"alert('{c}')\">",
+        "<svg onload=\"alert('{c}')\">",
+        "'\"><script>alert('{c}')</script>",
+        '" onfocus="alert(\'{c}\')" autofocus="',
+        "javascript:alert('{c}')",
+        "<details open ontoggle=\"alert('{c}')\">",
     ]
 
-    # --- A03: Command Injection ---
-    CMD_INJECTION_PAYLOADS = ["; echo CMDINJECT_{canary}", "| echo CMDINJECT_{canary}",
-                               "& echo CMDINJECT_{canary}"]
+    # ------------------------------------------------------------------ A03 CMD
+    CMD_PAYLOADS = ["; echo CMDX_{c}", "| echo CMDX_{c}", "& echo CMDX_{c}",
+                    "`echo CMDX_{c}`", "$(echo CMDX_{c})"]
 
-    # --- A05: Security headers ---
-    REQUIRED_SECURITY_HEADERS = {
-        'Content-Security-Policy': 'prevents XSS and data injection attacks',
-        'X-Frame-Options': 'prevents clickjacking',
-        'X-Content-Type-Options': 'prevents MIME-type sniffing',
+    CMD_PATTERN = re.compile(r'CMDX_[a-f0-9]{8}')
+
+    # ------------------------------------------------------------------ A03 LDAP
+    LDAP_PAYLOADS = ["*)(uid=*))(\0", "*()|%26'", "*()|&'", "admin)(&)"]
+    LDAP_ERRORS   = ['ldap_bind', 'ldap error', 'invalid dn syntax',
+                     'object class violation', 'ldap_search']
+
+    # ------------------------------------------------------------------ A03 NoSQL
+    NOSQL_PAYLOADS = ['{"$gt": ""}', '{"$ne": null}', '{"$where": "sleep(1000)"}',
+                      "' || '1'=='1", '[$ne]=1']
+    NOSQL_ERRORS   = ['castError', 'mongo', 'bson', 'mongoose', '_id',
+                      'objectid', 'nosql', 'couchdb']
+
+    # ------------------------------------------------------------------ A04 Path Traversal
+    PATH_TRAVERSAL_PAYLOADS = [
+        '../../../etc/passwd', '..\\..\\..\\windows\\win.ini',
+        '....//....//....//etc/passwd', '%2e%2e%2fetc%2fpasswd',
+        '..%2F..%2F..%2Fetc%2Fpasswd',
+    ]
+    PATH_TRAVERSAL_SIGS = ['root:x:0:0', '[extensions]', 'daemon:x:', 'bin/bash']
+
+    # ------------------------------------------------------------------ A04 Open Redirect
+    OPEN_REDIRECT_PAYLOADS = [
+        'https://evil.com', '//evil.com', '/\\evil.com', 'https://evil.com%2F@target.com',
+    ]
+    REDIRECT_PARAMS = re.compile(
+        r'^(url|uri|redirect|next|to|goto|target|redir|return|returnurl|'
+        r'destination|location|forward|back|link|continue)$', re.I
+    )
+
+    # ------------------------------------------------------------------ A05 Headers
+    REQUIRED_HEADERS = {
+        'Content-Security-Policy':   'prevents XSS and data injection',
+        'X-Frame-Options':           'prevents clickjacking',
+        'X-Content-Type-Options':    'prevents MIME-type sniffing',
         'Strict-Transport-Security': 'enforces HTTPS',
-        'Referrer-Policy': 'controls referrer leakage',
+        'Referrer-Policy':           'controls referrer leakage',
+        'Permissions-Policy':        'controls browser feature access',
     }
 
-    # TRACE/CONNECT are dangerous; OPTIONS is informational
-    DANGEROUS_METHODS = ['TRACE', 'CONNECT']
+    DANGEROUS_METHODS = ['TRACE', 'CONNECT', 'PUT', 'DELETE']
 
-    def __init__(self, timeout: int = 5):
+    DEBUG_PATHS = ['/debug', '/.env', '/phpinfo.php', '/server-status',
+                   '/actuator', '/actuator/env', '/actuator/health',
+                   '/_profiler', '/telescope', '/horizon']
+
+    DIR_LISTING_SIGS = ['index of /', 'parent directory', 'directory listing']
+
+    # ------------------------------------------------------------------ A07 Default creds
+    DEFAULT_CREDS = [
+        ('admin', 'admin'), ('admin', 'password'), ('admin', '123456'),
+        ('root', 'root'), ('test', 'test'), ('guest', 'guest'),
+    ]
+
+    # ------------------------------------------------------------------ A10 SSRF
+    SSRF_PARAMS = re.compile(
+        r'^(url|uri|src|href|redirect|next|to|file|path|image|fetch|'
+        r'download|load|resource|endpoint|proxy|callback|open|webhook|dest)$', re.I
+    )
+
+    SSRF_TARGETS   = ['http://127.0.0.1/', 'http://169.254.169.254/latest/meta-data/']
+    SSRF_INDICATORS = ['ami-id', 'instance-id', 'local-ipv4', 'root:x:0:0',
+                       'instance-type', 'mac', 'security-credentials']
+
+    # ------------------------------------------------------------------
+    def __init__(self, timeout: int = 7, auth_headers: Optional[Dict] = None,
+                 auth_cookies: Optional[Dict] = None):
+        """
+        Args:
+            timeout:      HTTP request timeout in seconds.
+            auth_headers: Optional dict of auth headers (e.g. Authorization Bearer).
+            auth_cookies: Optional dict of session cookies for authenticated scanning.
+        """
         self.timeout = timeout
+        self.auth_headers: Dict = auth_headers or {}
+        self.auth_cookies: Dict = auth_cookies or {}
         self.vulnerabilities: List[Dict] = []
-        self.progress_callback = None
+        self._progress_cb = None
 
-    def set_progress_callback(self, callback):
-        self.progress_callback = callback
+    # ------------------------------------------------------------------ progress
+    def set_progress_callback(self, cb):
+        self._progress_cb = cb
 
-    def _report_progress(self, test_name: str, status: str):
-        if self.progress_callback:
-            self.progress_callback(f"{test_name}: {status}")
+    def _progress(self, msg: str):
+        if self._progress_cb:
+            self._progress_cb(msg)
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ HTTP helpers
+    def _headers(self, extra: Optional[Dict] = None) -> Dict:
+        h = {'User-Agent': 'CyberX-Scanner/2.0'}
+        h.update(self.auth_headers)
+        if extra:
+            h.update(extra)
+        return h
 
-    def scan_url(self, url: str) -> Dict:
-        """Scan a URL for all OWASP Top 10 vulnerabilities."""
-        self.vulnerabilities = []
-
+    def _get(self, url: str, allow_redirects: bool = True,
+             extra_headers: Optional[Dict] = None) -> Optional[requests.Response]:
         try:
-            self._report_progress("A02 Cryptographic Failures", "Testing...")
-            self._scan_cryptographic_failures(url)
-
-            self._report_progress("A03 Injection (SQLi)", "Testing...")
-            self._scan_sql_injection(url)
-
-            self._report_progress("A03 Injection (XSS)", "Testing...")
-            self._scan_xss(url)
-
-            self._report_progress("A05 Security Misconfiguration", "Testing...")
-            self._scan_security_misconfiguration(url)
-
-            self._report_progress("A01 Broken Access Control", "Testing...")
-            self._scan_broken_access_control(url)
-
-            self._report_progress("A07 Authentication Failures", "Testing...")
-            self._scan_authentication(url)
-
-            self._report_progress("A10 SSRF", "Testing...")
-            self._scan_ssrf(url)
-
-            self._report_progress("Scan", "Complete!")
-
+            return requests.get(
+                url, timeout=self.timeout, headers=self._headers(extra_headers),
+                cookies=self.auth_cookies, allow_redirects=allow_redirects, verify=False
+            )
         except Exception as e:
-            logger.error(f"Scan error: {str(e)}")
-            self.vulnerabilities.append({
-                'owasp_category': 'Scan Error',
-                'type': 'Scanner Error',
-                'severity': 'MEDIUM',
-                'description': str(e),
-                'cvss_score': 0,
-            })
+            logger.debug(f'GET {url} failed: {e}')
+            return None
 
-        return self._generate_report()
+    def _post(self, url: str, data: Optional[Dict] = None,
+              json_body=None, extra_headers: Optional[Dict] = None) -> Optional[requests.Response]:
+        try:
+            return requests.post(
+                url, timeout=self.timeout, headers=self._headers(extra_headers),
+                cookies=self.auth_cookies, data=data, json=json_body, verify=False
+            )
+        except Exception as e:
+            logger.debug(f'POST {url} failed: {e}')
+            return None
 
-    # ------------------------------------------------------------------
-    # A01 – Broken Access Control
-    # ------------------------------------------------------------------
+    def _head(self, url: str) -> Optional[requests.Response]:
+        try:
+            return requests.head(
+                url, timeout=self.timeout, headers=self._headers(),
+                cookies=self.auth_cookies, allow_redirects=True, verify=False
+            )
+        except Exception as e:
+            logger.debug(f'HEAD {url} failed: {e}')
+            return None
 
-    def _scan_broken_access_control(self, url: str):
-        """
-        A01: Test for IDOR and forced browsing.
-
-        IDOR check: only flags if the URL has a numeric ID-style parameter
-        (e.g. ?id=3, ?user_id=42) — not just any param containing 'id'.
-        Auth-bypass: checks HTTP 200 on an admin/dashboard path without
-        session credentials, but does NOT keyword-scan the response body
-        (too noisy).
-        """
+    # ------------------------------------------------------------------ URL helpers
+    @staticmethod
+    def _inject_get_param(url: str, param: str, payload: str) -> str:
+        """Return URL with `payload` replacing `param`'s value entirely."""
         parsed = urlparse(url)
-        params = parse_qs(parsed.query)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        params[param] = [payload]
+        return urlunparse(parsed._replace(query=urlencode({k: v[0] for k, v in params.items()})))
 
-        # --- IDOR: numeric ID parameters ---
-        idor_param_patterns = re.compile(
-            r'^(id|user_?id|post_?id|account_?id|record_?id|file_?id|item_?id)$',
-            re.IGNORECASE
-        )
-        for param, values in params.items():
-            if idor_param_patterns.match(param) and values and values[0].isdigit():
-                self.vulnerabilities.append({
-                    'owasp_category': 'A01',
-                    'type': 'Potential IDOR',
-                    'severity': 'HIGH',
-                    'description': (
-                        f'Parameter "{param}={values[0]}" looks like a direct object '
-                        f'reference. Verify that access control prevents horizontal/vertical '
-                        f'privilege escalation by altering this value.'
-                    ),
-                    'url': url,
-                    'cvss_score': 7.5,
-                })
-                break  # One finding per URL is enough
-
-        # --- Forced browsing: admin/dashboard paths without cookies ---
-        admin_paths = ['/admin', '/admin/', '/dashboard', '/administrator',
-                       '/wp-admin', '/manage', '/console']
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        for path in admin_paths:
-            test_url = base + path
-            try:
-                resp = requests.get(
-                    test_url, timeout=self.timeout,
-                    allow_redirects=False,
-                    headers={'User-Agent': 'CyberScan/1.0'}
-                )
-                # 200 on an admin path with no session = possible auth bypass
-                if resp.status_code == 200:
-                    self.vulnerabilities.append({
-                        'owasp_category': 'A01',
-                        'type': 'Unprotected Admin Endpoint',
-                        'severity': 'CRITICAL',
-                        'description': (
-                            f'Admin path "{path}" returned HTTP 200 without '
-                            f'authentication. Verify this is intentional.'
-                        ),
-                        'url': test_url,
-                        'cvss_score': 9.1,
-                    })
-                    break
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    # A02 – Cryptographic Failures
-    # ------------------------------------------------------------------
-
-    def _scan_cryptographic_failures(self, url: str):
-        """A02: HTTP instead of HTTPS; invalid SSL certificate."""
-        parsed = urlparse(url)
-
-        if parsed.scheme == 'http':
-            self.vulnerabilities.append({
-                'owasp_category': 'A02',
-                'type': 'Unencrypted Connection',
-                'severity': 'HIGH',
-                'description': 'Site uses HTTP — data is transmitted in plaintext.',
-                'url': url,
-                'cvss_score': 7.5,
-            })
-
-        if parsed.scheme == 'https':
-            try:
-                requests.get(url, timeout=self.timeout, verify=True)
-            except requests.exceptions.SSLError:
-                self.vulnerabilities.append({
-                    'owasp_category': 'A02',
-                    'type': 'SSL/TLS Certificate Error',
-                    'severity': 'MEDIUM',
-                    'description': 'Invalid or self-signed SSL/TLS certificate detected.',
-                    'url': url,
-                    'cvss_score': 6.5,
-                })
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    # A03 – Injection: SQL
-    # ------------------------------------------------------------------
-
-    def _build_injected_url(self, url: str, param: str, payload: str) -> str:
-        """Return a URL with `payload` appended to `param`'s value."""
+    @staticmethod
+    def _append_get_param(url: str, param: str, payload: str) -> str:
+        """Return URL with `payload` appended to `param`'s existing value."""
         parsed = urlparse(url)
         params = parse_qs(parsed.query, keep_blank_values=True)
         original = params.get(param, [''])[0]
         params[param] = [original + payload]
-        new_query = urlencode({k: v[0] for k, v in params.items()})
-        return urlunparse(parsed._replace(query=new_query))
+        return urlunparse(parsed._replace(query=urlencode({k: v[0] for k, v in params.items()})))
 
-    def _detect_sqli_in_response(self, text: str) -> Optional[Tuple[str, str]]:
-        """Return (db_type, signature) if a SQL error is found, else None."""
-        lower = text.lower()
-        for db_type, signatures in self.SQL_ERROR_SIGNATURES.items():
-            for sig in signatures:
-                if sig in lower:
-                    return db_type, sig
+    # ------------------------------------------------------------------ SQL helpers
+    def _sql_hit(self, text: str) -> Optional[Tuple[str, str]]:
+        low = text.lower()
+        for db, sigs in self.SQL_ERROR_SIGNATURES.items():
+            for sig in sigs:
+                if sig in low:
+                    return db, sig
         return None
 
-    def _scan_sql_injection(self, url: str):
-        """
-        A03/SQLi: Inject error-triggering payloads into every existing query
-        parameter. Only reports if a known DB error signature appears in the
-        response — avoids the false 'SQL' keyword match.
-        """
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
+    # ====================================================================
+    # Public entry point
+    # ====================================================================
 
+    def scan_url(self, url: str) -> Dict:
+        """Run all OWASP Top 10 checks against `url`."""
+        self.vulnerabilities = []
+
+        checks = [
+            ('A01 Broken Access Control',        self._scan_a01),
+            ('A02 Cryptographic Failures',        self._scan_a02),
+            ('A03 SQLi – GET params',             self._scan_a03_sqli_get),
+            ('A03 SQLi – POST body',              self._scan_a03_sqli_post),
+            ('A03 SQLi – Headers',                self._scan_a03_sqli_headers),
+            ('A03 XSS – Reflected',               self._scan_a03_xss),
+            ('A03 Command Injection',             self._scan_a03_cmd),
+            ('A03 LDAP Injection',                self._scan_a03_ldap),
+            ('A03 NoSQL Injection',               self._scan_a03_nosql),
+            ('A04 Path Traversal',                self._scan_a04_path_traversal),
+            ('A04 Open Redirect',                 self._scan_a04_open_redirect),
+            ('A05 Security Misconfiguration',     self._scan_a05),
+            ('A06 Vulnerable Components',         self._scan_a06),
+            ('A07 Auth Failures',                 self._scan_a07),
+            ('A08 Software Integrity Failures',   self._scan_a08),
+            ('A09 Logging Failures',              self._scan_a09),
+            ('A10 SSRF',                          self._scan_a10),
+        ]
+
+        for label, fn in checks:
+            self._progress(f'{label}: Testing…')
+            try:
+                fn(url)
+            except Exception as exc:
+                logger.error(f'{label} error: {exc}')
+
+        self._progress('Scan complete ✓')
+        return self._build_report()
+
+    # ====================================================================
+    # A01 – Broken Access Control
+    # ====================================================================
+
+    def _scan_a01(self, url: str):
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+
+        # IDOR – numeric ID params
+        id_pat = re.compile(
+            r'^(id|user_?id|post_?id|account_?id|record_?id|file_?id|item_?id|order_?id)$', re.I
+        )
+        for param, vals in params.items():
+            if id_pat.match(param) and vals and vals[0].isdigit():
+                self.vulnerabilities.append(_vuln(
+                    'A01', 'Potential IDOR', 'HIGH',
+                    f'Parameter "{param}={vals[0]}" is a direct object reference. '
+                    f'Verify access control prevents horizontal/vertical privilege escalation.',
+                    url, 7.5, f'param={param}&value={vals[0]}'
+                ))
+                break
+
+        # Forced browsing – admin paths (no session cookies)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        admin_paths = ['/admin', '/admin/', '/dashboard', '/administrator',
+                       '/wp-admin', '/manage', '/console', '/control-panel',
+                       '/superuser', '/backoffice', '/staff', '/internal']
+        for path in admin_paths:
+            resp = self._get(base + path, allow_redirects=False,
+                             extra_headers={'Cookie': ''})
+            if resp and resp.status_code == 200:
+                self.vulnerabilities.append(_vuln(
+                    'A01', 'Unprotected Admin Endpoint', 'CRITICAL',
+                    f'"{path}" returned HTTP 200 without authentication.',
+                    base + path, 9.1, f'HTTP {resp.status_code}'
+                ))
+                break  # one finding is enough
+
+    # ====================================================================
+    # A02 – Cryptographic Failures
+    # ====================================================================
+
+    def _scan_a02(self, url: str):
+        parsed = urlparse(url)
+
+        if parsed.scheme == 'http':
+            self.vulnerabilities.append(_vuln(
+                'A02', 'Unencrypted Connection', 'HIGH',
+                'Site transmits data over HTTP (plaintext). All traffic can be intercepted.',
+                url, 7.5
+            ))
+            # Also check if HTTPS redirect exists
+            https_url = url.replace('http://', 'https://', 1)
+            resp = self._get(https_url)
+            if resp is None:
+                self.vulnerabilities.append(_vuln(
+                    'A02', 'No HTTPS Available', 'HIGH',
+                    'HTTPS equivalent of this URL is unreachable — no fallback encryption.',
+                    https_url, 7.5
+                ))
+
+        if parsed.scheme == 'https':
+            try:
+                requests.get(url, timeout=self.timeout, verify=True,
+                             headers=self._headers())
+            except requests.exceptions.SSLError as e:
+                self.vulnerabilities.append(_vuln(
+                    'A02', 'SSL/TLS Certificate Error', 'HIGH',
+                    'Invalid, expired, or self-signed TLS certificate detected.',
+                    url, 7.4, str(e)[:200]
+                ))
+            except Exception:
+                pass
+
+        # Check HSTS only on HTTPS
+        if parsed.scheme == 'https':
+            resp = self._head(url)
+            if resp and 'Strict-Transport-Security' not in resp.headers:
+                self.vulnerabilities.append(_vuln(
+                    'A02', 'Missing HSTS Header', 'MEDIUM',
+                    'Strict-Transport-Security header absent. Browsers may downgrade to HTTP.',
+                    url, 5.9
+                ))
+
+    # ====================================================================
+    # A03 – SQL Injection (GET parameters)
+    # ====================================================================
+
+    def _scan_a03_sqli_get(self, url: str):
+        params = parse_qs(urlparse(url).query, keep_blank_values=True)
         if not params:
             return
 
         for param in params:
-            for payload in self.SQL_INJECTION_PAYLOADS:
-                test_url = self._build_injected_url(url, param, payload)
-                try:
-                    resp = requests.get(
-                        test_url, timeout=self.timeout,
-                        headers={'User-Agent': 'CyberScan/1.0'}
-                    )
-                    match = self._detect_sqli_in_response(resp.text)
-                    if match:
-                        db_type, sig = match
-                        self.vulnerabilities.append({
-                            'owasp_category': 'A03',
-                            'type': 'SQL Injection',
-                            'severity': 'CRITICAL',
-                            'description': (
-                                f'SQL injection detected in parameter "{param}" '
-                                f'(payload: {payload!r}). DB fingerprint: {db_type} '
-                                f'— matched signature: "{sig}".'
-                            ),
-                            'url': test_url,
-                            'cvss_score': 9.8,
-                        })
-                        return  # One confirmed SQLi finding is enough
-                except Exception as e:
-                    logger.debug(f"SQLi test error on {param}: {e}")
-
-    # ------------------------------------------------------------------
-    # A03 – Injection: XSS (canary-based)
-    # ------------------------------------------------------------------
-
-    def _scan_xss(self, url: str):
-        """
-        A03/XSS: Canary-token approach — each payload contains a unique random
-        hex string. A positive only fires when that exact canary appears
-        unescaped in the response, preventing false positives from generic
-        echo behaviour or coincidental matches.
-        """
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-
-        # If no existing params, probe a common reflected search parameter
-        probe_params = list(params.keys()) if params else ['q', 'search', 'query']
-
-        for param in probe_params:
-            for template in self.XSS_VECTOR_TEMPLATES:
-                canary = secrets.token_hex(8)
-                payload = template.replace('{canary}', canary)
-
-                # Build test URL — inject into existing param or add new one
-                if params:
-                    test_url = self._build_injected_url(url, param, payload)
-                else:
-                    base = url.split('?')[0]
-                    test_url = f"{base}?{param}={requests.utils.quote(payload)}"
-
-                try:
-                    resp = requests.get(
-                        test_url, timeout=self.timeout,
-                        headers={'User-Agent': 'CyberScan/1.0'}
-                    )
-                    # Require the full payload (with canary) to appear verbatim
-                    if canary in resp.text and payload in resp.text:
-                        self.vulnerabilities.append({
-                            'owasp_category': 'A03',
-                            'type': 'Reflected XSS',
-                            'severity': 'HIGH',
-                            'description': (
-                                f'Reflected XSS in parameter "{param}". '
-                                f'Canary "{canary}" reflected verbatim and unescaped.'
-                            ),
-                            'url': test_url,
-                            'cvss_score': 6.1,
-                        })
+            for payload in self.SQL_PAYLOADS:
+                test_url = self._append_get_param(url, param, payload)
+                resp = self._get(test_url)
+                if resp:
+                    hit = self._sql_hit(resp.text)
+                    if hit:
+                        db, sig = hit
+                        self.vulnerabilities.append(_vuln(
+                            'A03', 'SQL Injection (GET)', 'CRITICAL',
+                            f'SQLi in GET param "{param}" with payload {payload!r}. '
+                            f'DB fingerprint: {db}. Matched: "{sig}".',
+                            test_url, 9.8, sig
+                        ))
                         return
-                except Exception as e:
-                    logger.debug(f"XSS test error on {param}: {e}")
 
-    # ------------------------------------------------------------------
-    # A05 – Security Misconfiguration
-    # ------------------------------------------------------------------
+    # ====================================================================
+    # A03 – SQL Injection (POST body)
+    # ====================================================================
 
-    def _scan_security_misconfiguration(self, url: str):
+    def _scan_a03_sqli_post(self, url: str):
         """
-        A05: Missing security response headers; server version disclosure;
-        dangerous HTTP methods. Uses a HEAD request for header checks to
-        avoid downloading large bodies unnecessarily.
+        Probe common POST form field names with SQL payloads.
+        Covers login forms, search boxes, contact forms, API endpoints.
         """
-        try:
-            resp = requests.head(
-                url, timeout=self.timeout,
-                headers={'User-Agent': 'CyberScan/1.0'},
-                allow_redirects=True
-            )
-            headers = resp.headers
+        # Common field names found in web forms
+        common_fields = ['username', 'user', 'email', 'password', 'search',
+                         'query', 'q', 'id', 'name', 'input', 'data', 'value',
+                         'comment', 'message', 'title', 'content', 'filter']
 
-            # Missing security headers
-            missing = [
-                f"{h} ({desc})"
-                for h, desc in self.REQUIRED_SECURITY_HEADERS.items()
-                if h not in headers
-            ]
-            if missing:
-                severity = 'HIGH' if len(missing) >= 4 else 'MEDIUM'
-                self.vulnerabilities.append({
-                    'owasp_category': 'A05',
-                    'type': 'Missing Security Headers',
-                    'severity': severity,
-                    'description': f'Missing: {", ".join(missing)}.',
-                    'url': url,
-                    'cvss_score': 6.5 if severity == 'HIGH' else 5.3,
-                })
+        for field in common_fields:
+            for payload in self.SQL_PAYLOADS[:4]:  # keep POST tests lean
+                data = {field: payload}
+                resp = self._post(url, data=data)
+                if resp:
+                    hit = self._sql_hit(resp.text)
+                    if hit:
+                        db, sig = hit
+                        self.vulnerabilities.append(_vuln(
+                            'A03', 'SQL Injection (POST body)', 'CRITICAL',
+                            f'SQLi in POST field "{field}" with payload {payload!r}. '
+                            f'DB fingerprint: {db}. Matched: "{sig}".',
+                            url, 9.8, sig
+                        ))
+                        return
 
-            # Server/version disclosure
-            for disclosure_header in ('Server', 'X-Powered-By', 'X-AspNet-Version'):
-                if disclosure_header in headers:
-                    self.vulnerabilities.append({
-                        'owasp_category': 'A05',
-                        'type': 'Technology Disclosure',
-                        'severity': 'LOW',
-                        'description': (
-                            f'Header "{disclosure_header}" reveals server '
-                            f'technology: {headers[disclosure_header]}'
-                        ),
-                        'url': url,
-                        'cvss_score': 3.7,
-                    })
+        # Also try JSON body (REST APIs)
+        for payload in self.SQL_PAYLOADS[:3]:
+            json_body = {'id': payload, 'query': payload}
+            resp = self._post(url, json_body=json_body,
+                              extra_headers={'Content-Type': 'application/json'})
+            if resp:
+                hit = self._sql_hit(resp.text)
+                if hit:
+                    db, sig = hit
+                    self.vulnerabilities.append(_vuln(
+                        'A03', 'SQL Injection (JSON body)', 'CRITICAL',
+                        f'SQLi in JSON body with payload {payload!r}. '
+                        f'DB fingerprint: {db}.',
+                        url, 9.8, sig
+                    ))
+                    return
 
-            # Dangerous HTTP methods
-            for method in self.DANGEROUS_METHODS:
+    # ====================================================================
+    # A03 – SQL Injection (HTTP headers)
+    # ====================================================================
+
+    def _scan_a03_sqli_headers(self, url: str):
+        """
+        Inject SQL payloads into headers commonly logged / parsed server-side:
+        X-Forwarded-For, User-Agent, Referer, X-Custom-IP-Authorization, Cookie.
+        """
+        injectable_headers = {
+            'X-Forwarded-For':          "192.168.1.1{p}",
+            'User-Agent':               "Mozilla/5.0{p}",
+            'Referer':                  f"{url}{{p}}",
+            'X-Custom-IP-Authorization': "127.0.0.1{p}",
+        }
+
+        for header, template in injectable_headers.items():
+            for payload in self.SQL_PAYLOADS[:3]:
+                injected = template.format(p=payload)
+                resp = self._get(url, extra_headers={header: injected})
+                if resp:
+                    hit = self._sql_hit(resp.text)
+                    if hit:
+                        db, sig = hit
+                        self.vulnerabilities.append(_vuln(
+                            'A03', f'SQL Injection (Header: {header})', 'CRITICAL',
+                            f'SQLi via HTTP header "{header}" with payload {payload!r}. '
+                            f'DB fingerprint: {db}.',
+                            url, 9.8, sig
+                        ))
+                        return
+
+    # ====================================================================
+    # A03 – Reflected XSS
+    # ====================================================================
+
+    def _scan_a03_xss(self, url: str):
+        parsed = urlparse(url)
+        params = list(parse_qs(parsed.query).keys()) or ['q', 'search', 'query', 'input', 's']
+
+        for param in params:
+            for template in self.XSS_TEMPLATES:
+                canary = secrets.token_hex(8)
+                payload = template.replace('{c}', canary)
+
+                if parse_qs(parsed.query):
+                    test_url = self._inject_get_param(url, param, payload)
+                else:
+                    test_url = f"{url.split('?')[0]}?{param}={quote(payload)}"
+
+                resp = self._get(test_url)
+                if resp and canary in resp.text and payload in resp.text:
+                    self.vulnerabilities.append(_vuln(
+                        'A03', 'Reflected XSS', 'HIGH',
+                        f'Reflected XSS in param "{param}". '
+                        f'Canary "{canary}" reflected verbatim.',
+                        test_url, 6.1, payload[:80]
+                    ))
+                    return
+
+        # Also test POST body XSS
+        for field in ['search', 'q', 'query', 'input', 'comment', 'message']:
+            canary = secrets.token_hex(8)
+            payload = f"<script>alert('{canary}')</script>"
+            resp = self._post(url, data={field: payload})
+            if resp and canary in resp.text and payload in resp.text:
+                self.vulnerabilities.append(_vuln(
+                    'A03', 'Reflected XSS (POST)', 'HIGH',
+                    f'POST XSS in field "{field}". Canary "{canary}" reflected.',
+                    url, 6.1, payload
+                ))
+                return
+
+    # ====================================================================
+    # A03 – Command Injection
+    # ====================================================================
+
+    def _scan_a03_cmd(self, url: str):
+        params = list(parse_qs(urlparse(url).query).keys())
+        if not params:
+            return
+
+        for param in params:
+            for tmpl in self.CMD_PAYLOADS[:3]:
+                canary = secrets.token_hex(4)
+                payload = tmpl.replace('{c}', canary)
+                test_url = self._append_get_param(url, param, payload)
+                resp = self._get(test_url)
+                if resp and f'CMDX_{canary}' in resp.text:
+                    self.vulnerabilities.append(_vuln(
+                        'A03', 'Command Injection', 'CRITICAL',
+                        f'OS command injection in param "{param}" with payload {payload!r}.',
+                        test_url, 9.8, f'CMDX_{canary} found in response'
+                    ))
+                    return
+
+    # ====================================================================
+    # A03 – LDAP Injection
+    # ====================================================================
+
+    def _scan_a03_ldap(self, url: str):
+        params = list(parse_qs(urlparse(url).query).keys())
+        if not params:
+            return
+
+        for param in params:
+            for payload in self.LDAP_PAYLOADS:
+                test_url = self._inject_get_param(url, param, payload)
+                resp = self._get(test_url)
+                if resp:
+                    low = resp.text.lower()
+                    for sig in self.LDAP_ERRORS:
+                        if sig in low:
+                            self.vulnerabilities.append(_vuln(
+                                'A03', 'LDAP Injection', 'HIGH',
+                                f'LDAP injection in param "{param}". Matched error: "{sig}".',
+                                test_url, 8.1, sig
+                            ))
+                            return
+
+    # ====================================================================
+    # A03 – NoSQL Injection
+    # ====================================================================
+
+    def _scan_a03_nosql(self, url: str):
+        params = list(parse_qs(urlparse(url).query).keys())
+        test_params = params or ['id', 'user', 'name']
+
+        for param in test_params:
+            for payload in self.NOSQL_PAYLOADS:
+                # GET param
+                test_url = self._inject_get_param(url, param, payload)
+                resp = self._get(test_url)
+                if resp:
+                    low = resp.text.lower()
+                    for sig in self.NOSQL_ERRORS:
+                        if sig in low:
+                            self.vulnerabilities.append(_vuln(
+                                'A03', 'NoSQL Injection', 'HIGH',
+                                f'NoSQL injection in param "{param}" with payload {payload!r}. '
+                                f'Matched: "{sig}".',
+                                test_url, 8.1, sig
+                            ))
+                            return
+
+                # JSON POST
                 try:
-                    method_resp = requests.request(
-                        method, url, timeout=self.timeout,
-                        headers={'User-Agent': 'CyberScan/1.0'}
-                    )
-                    if method_resp.status_code not in (405, 501, 400):
-                        self.vulnerabilities.append({
-                            'owasp_category': 'A05',
-                            'type': f'{method} Method Enabled',
-                            'severity': 'HIGH',
-                            'description': (
-                                f'HTTP method {method} returned '
-                                f'{method_resp.status_code} (expected 405).'
-                            ),
-                            'url': url,
-                            'cvss_score': 7.5,
-                        })
+                    import json as _json
+                    json_payload = _json.loads(payload) if payload.startswith('{') else payload
                 except Exception:
-                    pass
+                    json_payload = payload
+                resp2 = self._post(url, json_body={param: json_payload},
+                                   extra_headers={'Content-Type': 'application/json'})
+                if resp2:
+                    low2 = resp2.text.lower()
+                    for sig in self.NOSQL_ERRORS:
+                        if sig in low2:
+                            self.vulnerabilities.append(_vuln(
+                                'A03', 'NoSQL Injection (JSON)', 'HIGH',
+                                f'NoSQL injection via JSON body in field "{param}".',
+                                url, 8.1, sig
+                            ))
+                            return
 
-        except Exception as e:
-            logger.debug(f"A05 scan error: {e}")
+    # ====================================================================
+    # A04 – Insecure Design: Path Traversal
+    # ====================================================================
 
-    # ------------------------------------------------------------------
-    # A07 – Authentication Failures
-    # ------------------------------------------------------------------
+    def _scan_a04_path_traversal(self, url: str):
+        params = list(parse_qs(urlparse(url).query).keys())
+        file_params = [p for p in params if re.search(
+            r'(file|path|doc|page|include|load|template|view|dir|folder|name)', p, re.I
+        )]
+        probe_params = file_params or params or ['file', 'path', 'page']
 
-    def _scan_authentication(self, url: str):
-        """
-        A07: Detect insecure cookie attributes by inspecting the raw
-        Set-Cookie header, not the string repr of the Cookie object.
-        """
-        try:
-            resp = requests.get(
-                url, timeout=self.timeout,
-                headers={'User-Agent': 'CyberScan/1.0'}
-            )
+        for param in probe_params[:3]:
+            for payload in self.PATH_TRAVERSAL_PAYLOADS:
+                test_url = self._inject_get_param(url, param, payload)
+                resp = self._get(test_url)
+                if resp:
+                    for sig in self.PATH_TRAVERSAL_SIGS:
+                        if sig in resp.text:
+                            self.vulnerabilities.append(_vuln(
+                                'A04', 'Path Traversal', 'CRITICAL',
+                                f'Path traversal in param "{param}". '
+                                f'Matched: "{sig}" in response.',
+                                test_url, 9.1, sig
+                            ))
+                            return
 
-            # Check raw Set-Cookie headers (requests doesn't expose flags via .cookies)
-            set_cookie_headers = resp.headers.get('Set-Cookie', '')
-            if not set_cookie_headers:
-                # Some servers return multiple Set-Cookie headers
-                set_cookie_headers = '\n'.join(
-                    v for k, v in resp.headers.items()
-                    if k.lower() == 'set-cookie'
+    # ====================================================================
+    # A04 – Insecure Design: Open Redirect
+    # ====================================================================
+
+    def _scan_a04_open_redirect(self, url: str):
+        params = parse_qs(urlparse(url).query)
+        redirect_params = [p for p in params if self.REDIRECT_PARAMS.match(p)]
+
+        if not redirect_params:
+            return
+
+        for param in redirect_params:
+            for payload in self.OPEN_REDIRECT_PAYLOADS:
+                test_url = self._inject_get_param(url, param, payload)
+                resp = self._get(test_url, allow_redirects=False)
+                if resp and resp.status_code in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get('Location', '')
+                    if 'evil.com' in loc or loc.startswith('//') :
+                        self.vulnerabilities.append(_vuln(
+                            'A04', 'Open Redirect', 'MEDIUM',
+                            f'Open redirect via param "{param}". '
+                            f'Location header: {loc}',
+                            test_url, 6.1, f'Location: {loc}'
+                        ))
+                        return
+
+    # ====================================================================
+    # A05 – Security Misconfiguration
+    # ====================================================================
+
+    def _scan_a05(self, url: str):
+        resp = self._head(url)
+        if not resp:
+            return
+
+        headers = resp.headers
+
+        # Missing security headers
+        missing = [f"{h} ({d})" for h, d in self.REQUIRED_HEADERS.items() if h not in headers]
+        if missing:
+            severity = 'HIGH' if len(missing) >= 4 else 'MEDIUM'
+            self.vulnerabilities.append(_vuln(
+                'A05', 'Missing Security Headers', severity,
+                f'Missing: {", ".join(missing)}.',
+                url, 6.5 if severity == 'HIGH' else 5.3, ', '.join(missing)
+            ))
+
+        # Server version disclosure
+        for dh in ('Server', 'X-Powered-By', 'X-AspNet-Version', 'X-Generator',
+                    'X-Drupal-Cache', 'X-Runtime', 'X-Version'):
+            if dh in headers:
+                self.vulnerabilities.append(_vuln(
+                    'A05', 'Technology Disclosure', 'LOW',
+                    f'Header "{dh}" reveals technology: {headers[dh]}',
+                    url, 3.7, f'{dh}: {headers[dh]}'
+                ))
+
+        # Dangerous HTTP methods
+        for method in self.DANGEROUS_METHODS:
+            try:
+                r = requests.request(method, url, timeout=self.timeout,
+                                     headers=self._headers(), verify=False)
+                if r.status_code not in (405, 501, 400, 403):
+                    self.vulnerabilities.append(_vuln(
+                        'A05', f'{method} Method Enabled', 'HIGH',
+                        f'HTTP {method} returned {r.status_code} (expected 405/403).',
+                        url, 7.5, f'HTTP {r.status_code}'
+                    ))
+            except Exception:
+                pass
+
+        # Debug / sensitive paths
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        for path in self.DEBUG_PATHS:
+            r = self._get(base + path, allow_redirects=False)
+            if r and r.status_code == 200 and len(r.text) > 50:
+                self.vulnerabilities.append(_vuln(
+                    'A05', 'Exposed Debug/Config Endpoint', 'HIGH',
+                    f'"{path}" returned HTTP 200 with {len(r.text)} bytes of content.',
+                    base + path, 7.5, f'HTTP 200, {len(r.text)} bytes'
+                ))
+                break
+
+        # Directory listing
+        dir_url = base + '/'
+        r = self._get(dir_url)
+        if r:
+            low = r.text.lower()
+            for sig in self.DIR_LISTING_SIGS:
+                if sig in low:
+                    self.vulnerabilities.append(_vuln(
+                        'A05', 'Directory Listing Enabled', 'MEDIUM',
+                        f'Web root appears to expose a directory listing (matched "{sig}").',
+                        dir_url, 5.3, sig
+                    ))
+                    break
+
+    # ====================================================================
+    # A06 – Vulnerable and Outdated Components
+    # ====================================================================
+
+    def _scan_a06(self, url: str):
+        """Extract server/framework version strings and flag known-old patterns."""
+        resp = self._head(url)
+        if not resp:
+            return
+
+        # Version disclosure via headers
+        version_headers = {
+            'Server':            r'(apache|nginx|iis|lighttpd)[/\s]+([\d.]+)',
+            'X-Powered-By':      r'(php|asp\.net|express)[/\s]*([\d.]*)',
+            'X-AspNet-Version':  r'([\d.]+)',
+            'X-Generator':       r'(.+)',
+        }
+
+        KNOWN_OLD = {
+            'apache': ('2.2', '2.4.49', '2.4.50'),
+            'nginx':  ('1.12', '1.14', '1.16'),
+            'php':    ('5.', '7.0', '7.1', '7.2'),
+            'asp.net': ('1.', '2.', '3.5'),
+        }
+
+        for header, pattern in version_headers.items():
+            val = resp.headers.get(header, '')
+            if not val:
+                continue
+            m = re.search(pattern, val, re.I)
+            if m:
+                tech = m.group(1).lower() if m.lastindex and m.lastindex >= 1 else ''
+                version = m.group(2) if m.lastindex and m.lastindex >= 2 else val
+
+                is_old = any(
+                    version.startswith(old)
+                    for old_versions in KNOWN_OLD.get(tech, [])
+                    for old in [old_versions]
                 )
 
-            if set_cookie_headers:
-                flags_lower = set_cookie_headers.lower()
-                missing_flags = []
-                if 'httponly' not in flags_lower:
-                    missing_flags.append('HttpOnly')
-                if 'secure' not in flags_lower:
-                    missing_flags.append('Secure')
-                if 'samesite' not in flags_lower:
-                    missing_flags.append('SameSite')
+                if is_old:
+                    self.vulnerabilities.append(_vuln(
+                        'A06', 'Outdated Component', 'HIGH',
+                        f'{header} reveals {val!r} — this version has known CVEs. '
+                        f'Update immediately.',
+                        url, 8.1, val
+                    ))
+                else:
+                    self.vulnerabilities.append(_vuln(
+                        'A06', 'Component Version Disclosed', 'LOW',
+                        f'{header} discloses "{val}". Confirm this is up-to-date.',
+                        url, 3.7, val
+                    ))
 
-                if missing_flags:
-                    self.vulnerabilities.append({
-                        'owasp_category': 'A07',
-                        'type': 'Insecure Cookie Flags',
-                        'severity': 'MEDIUM',
-                        'description': (
-                            f'Session cookie missing flags: '
-                            f'{", ".join(missing_flags)}.'
-                        ),
-                        'url': url,
-                        'cvss_score': 5.3,
-                    })
+    # ====================================================================
+    # A07 – Identification and Authentication Failures
+    # ====================================================================
 
-        except Exception as e:
-            logger.debug(f"A07 scan error: {e}")
+    def _scan_a07(self, url: str):
+        resp = self._get(url)
+        if not resp:
+            return
 
-    # ------------------------------------------------------------------
-    # A10 – SSRF
-    # ------------------------------------------------------------------
+        # Insecure cookie flags
+        raw_cookie = resp.headers.get('Set-Cookie', '')
+        if not raw_cookie:
+            raw_cookie = '\n'.join(
+                v for k, v in resp.headers.items() if k.lower() == 'set-cookie'
+            )
 
-    def _scan_ssrf(self, url: str):
-        """
-        A10: SSRF detection.
+        if raw_cookie:
+            low = raw_cookie.lower()
+            missing_flags = []
+            if 'httponly' not in low:
+                missing_flags.append('HttpOnly')
+            if 'secure' not in low:
+                missing_flags.append('Secure')
+            if 'samesite' not in low:
+                missing_flags.append('SameSite')
+            if missing_flags:
+                self.vulnerabilities.append(_vuln(
+                    'A07', 'Insecure Cookie Flags', 'MEDIUM',
+                    f'Session cookie missing: {", ".join(missing_flags)}.',
+                    url, 5.3, f'Missing: {", ".join(missing_flags)}'
+                ))
 
-        Strategy: inject an internal address into known URL-like parameters.
-        A hit is flagged only when the response contains content that would
-        only originate from the internal host (e.g. its title/body text) —
-        NOT simply because the word "localhost" appears anywhere on the page
-        (that would be a false positive).
-
-        For blind SSRF, response-time deviation is used as a secondary signal.
-        """
+        # HTTP Basic Auth over HTTP
         parsed = urlparse(url)
-        existing_params = parse_qs(parsed.query)
+        if parsed.scheme == 'http' and resp.status_code == 401:
+            www_auth = resp.headers.get('WWW-Authenticate', '')
+            if 'basic' in www_auth.lower():
+                self.vulnerabilities.append(_vuln(
+                    'A07', 'HTTP Basic Auth over HTTP', 'HIGH',
+                    'Server requests HTTP Basic authentication over unencrypted HTTP. '
+                    'Credentials are base64-encoded and trivially decoded.',
+                    url, 8.1, www_auth
+                ))
 
-        # Known SSRF-prone parameter names
-        ssrf_param_pattern = re.compile(
-            r'^(url|uri|src|href|redirect|next|to|file|path|image|fetch|'
-            r'download|load|resource|endpoint|proxy|callback|open)$',
-            re.IGNORECASE
+        # Default credential probe on login-like paths
+        login_paths = ['/login', '/admin/login', '/wp-login.php', '/signin',
+                       '/user/login', '/auth', '/administrator']
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        for path in login_paths:
+            login_url = base + path
+            r = self._get(login_url, allow_redirects=False)
+            if r and r.status_code == 200:
+                for user, pwd in self.DEFAULT_CREDS[:3]:
+                    pr = self._post(
+                        login_url,
+                        data={'username': user, 'password': pwd,
+                              'user': user, 'pass': pwd, 'email': user}
+                    )
+                    if pr and pr.status_code in (200, 302):
+                        # Heuristic: if response body changes significantly vs blank creds
+                        blank = self._post(login_url,
+                                           data={'username': '', 'password': ''})
+                        if blank and abs(len(pr.text) - len(blank.text)) > 200:
+                            self.vulnerabilities.append(_vuln(
+                                'A07', 'Default Credentials (Potential)', 'HIGH',
+                                f'Login at "{path}" responded differently for '
+                                f'{user!r}/{pwd!r} vs blank credentials — manual verification needed.',
+                                login_url, 9.8, f'user={user}&pass={pwd}'
+                            ))
+                            return
+                break  # only probe the first reachable login
+
+    # ====================================================================
+    # A08 – Software and Data Integrity Failures
+    # ====================================================================
+
+    def _scan_a08(self, url: str):
+        """Check for CDN <script>/<link> tags lacking SRI (integrity attribute)."""
+        resp = self._get(url)
+        if not resp:
+            return
+
+        cdn_pattern = re.compile(
+            r'<(script|link)[^>]+'
+            r'(?:src|href)=["\']https?://(?!(?:' + re.escape(urlparse(url).netloc) + r'))[^"\']+["\']'
+            r'(?![^>]*integrity=)',
+            re.I
         )
 
-        candidate_params = [
-            p for p in existing_params if ssrf_param_pattern.match(p)
+        matches = cdn_pattern.findall(resp.text)
+        if matches:
+            self.vulnerabilities.append(_vuln(
+                'A08', 'Missing Subresource Integrity (SRI)', 'MEDIUM',
+                f'{len(matches)} external script/stylesheet tag(s) lack an '
+                f'"integrity" attribute. A compromised CDN could inject malicious code.',
+                url, 6.1, f'{len(matches)} tag(s) without SRI'
+            ))
+
+    # ====================================================================
+    # A09 – Security Logging and Monitoring Failures
+    # ====================================================================
+
+    def _scan_a09(self, url: str):
+        """Probe for verbose error pages that leak stack traces or config."""
+        error_triggers = [
+            url + ('&' if '?' in url else '?') + '__error__=1',
+            url.rstrip('/') + '/nonexistent-path-xyz-12345',
         ]
 
-        if not candidate_params:
-            return  # No URL-like params found — skip to reduce noise
+        stack_trace_patterns = re.compile(
+            r'(traceback|stack trace|at \w+\.\w+\(|exception in thread|'
+            r'debug_mode|werkzeug debugger|laravel debugger|symfony exception|'
+            r'django\.core\.exceptions|rails error|at System\.|NullPointerException)',
+            re.I
+        )
 
-        internal_targets = ['http://127.0.0.1/', 'http://169.254.169.254/latest/meta-data/']
-
-        for param in candidate_params:
-            for target in internal_targets:
-                test_url = self._build_injected_url(url, param, '')
-                # Replace the param value entirely
-                test_parsed = urlparse(test_url)
-                all_params = parse_qs(test_parsed.query, keep_blank_values=True)
-                all_params[param] = [target]
-                new_query = urlencode({k: v[0] for k, v in all_params.items()})
-                test_url = urlunparse(test_parsed._replace(query=new_query))
-
-                try:
-                    import time
-                    t0 = time.time()
-                    resp = requests.get(
-                        test_url, timeout=self.timeout,
-                        headers={'User-Agent': 'CyberScan/1.0'}
-                    )
-                    elapsed = time.time() - t0
-
-                    # Look for AWS metadata or loopback service fingerprints
-                    body_lower = resp.text.lower()
-                    ssrf_indicators = [
-                        'ami-id', 'instance-id', 'local-ipv4',  # AWS metadata
-                        'root:x:0:0',                            # /etc/passwd
-                        '<title>apache',                         # internal apache
-                    ]
-                    if any(ind in body_lower for ind in ssrf_indicators):
-                        self.vulnerabilities.append({
-                            'owasp_category': 'A10',
-                            'type': 'SSRF (Confirmed)',
-                            'severity': 'CRITICAL',
-                            'description': (
-                                f'Parameter "{param}" fetched internal resource '
-                                f'({target}) and returned internal content.'
-                            ),
-                            'url': test_url,
-                            'cvss_score': 9.0,
-                        })
-                        return
-
-                    # Blind SSRF signal: timeout or unusual latency
-                    if elapsed >= self.timeout * 0.9:
-                        self.vulnerabilities.append({
-                            'owasp_category': 'A10',
-                            'type': 'Potential Blind SSRF',
-                            'severity': 'HIGH',
-                            'description': (
-                                f'Parameter "{param}" caused a near-timeout '
-                                f'({elapsed:.1f}s) when pointed at {target}. '
-                                f'Manual verification recommended.'
-                            ),
-                            'url': test_url,
-                            'cvss_score': 8.6,
-                        })
-                        return
-
-                except requests.Timeout:
-                    # A full timeout is a stronger blind SSRF signal
-                    self.vulnerabilities.append({
-                        'owasp_category': 'A10',
-                        'type': 'Potential Blind SSRF (Timeout)',
-                        'severity': 'HIGH',
-                        'description': (
-                            f'Request to {test_url} timed out when parameter '
-                            f'"{param}" was set to {target}. Possible blind SSRF.'
-                        ),
-                        'url': test_url,
-                        'cvss_score': 8.6,
-                    })
+        for trigger_url in error_triggers:
+            resp = self._get(trigger_url)
+            if resp and resp.status_code in (200, 500, 400):
+                m = stack_trace_patterns.search(resp.text)
+                if m:
+                    self.vulnerabilities.append(_vuln(
+                        'A09', 'Verbose Error / Stack Trace Disclosure', 'MEDIUM',
+                        f'Error page leaks internal stack trace or framework debug info. '
+                        f'Matched: "{m.group(0)}".',
+                        trigger_url, 5.3, m.group(0)[:120]
+                    ))
                     return
-                except Exception as e:
-                    logger.debug(f"SSRF test error: {e}")
 
-    # ------------------------------------------------------------------
-    # Report
-    # ------------------------------------------------------------------
+    # ====================================================================
+    # A10 – Server-Side Request Forgery (SSRF)
+    # ====================================================================
 
-    def _generate_report(self) -> Dict:
-        critical = sum(1 for v in self.vulnerabilities if v['severity'] == 'CRITICAL')
-        high = sum(1 for v in self.vulnerabilities if v['severity'] == 'HIGH')
+    def _scan_a10(self, url: str):
+        params = parse_qs(urlparse(url).query)
+        candidates = [p for p in params if self.SSRF_PARAMS.match(p)]
+
+        if not candidates:
+            return
+
+        for param in candidates:
+            for target in self.SSRF_TARGETS:
+                test_url = self._inject_get_param(url, param, target)
+                t0 = time.time()
+                resp = self._get(test_url)
+                elapsed = time.time() - t0
+
+                if resp:
+                    low = resp.text.lower()
+                    if any(ind in low for ind in self.SSRF_INDICATORS):
+                        self.vulnerabilities.append(_vuln(
+                            'A10', 'SSRF (Confirmed)', 'CRITICAL',
+                            f'Param "{param}" fetched {target} and returned internal content.',
+                            test_url, 9.0, ', '.join(
+                                i for i in self.SSRF_INDICATORS if i in low
+                            )
+                        ))
+                        return
+
+                    if elapsed >= self.timeout * 0.85:
+                        self.vulnerabilities.append(_vuln(
+                            'A10', 'Potential Blind SSRF (Timing)', 'HIGH',
+                            f'Param "{param}" caused {elapsed:.1f}s delay when pointed at {target}.',
+                            test_url, 8.6, f'{elapsed:.1f}s response time'
+                        ))
+                        return
+
+    # ====================================================================
+    # Report builder
+    # ====================================================================
+
+    def _build_report(self) -> Dict:
+        counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        for v in self.vulnerabilities:
+            sev = v.get('severity', 'LOW')
+            counts[sev] = counts.get(sev, 0) + 1
+
         return {
             'total_vulnerabilities': len(self.vulnerabilities),
-            'critical': critical,
-            'high': high,
+            'critical': counts['CRITICAL'],
+            'high':     counts['HIGH'],
+            'medium':   counts['MEDIUM'],
+            'low':      counts['LOW'],
             'vulnerabilities': self.vulnerabilities,
         }

@@ -749,3 +749,24 @@ footer {
 ::-webkit-scrollbar-thumb:hover {
     background: var(--accent-primary);
 }
+
+/* ── CyberX v2 additions ─────────────────────────── */
+.filter-btn {
+  padding: 5px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  transition: all .15s;
+}
+.filter-btn:hover, .filter-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+details summary { list-style: none; }
+details summary::-webkit-details-marker { display: none; }
+details[open] summary { margin-bottom: 6px; }
