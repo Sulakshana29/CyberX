@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  cyberx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: cyberx:latest
+    container_name: cyberx_app
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env          # create this from .env.example — never commit .env
+    environment:
+      FLASK_DEBUG: "0"
+    volumes:
+      # Persist generated reports outside the container
+      - cyberx_reports:/app/reports
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  cyberx_reports:

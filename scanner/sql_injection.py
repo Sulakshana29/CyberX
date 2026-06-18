@@ -180,11 +180,11 @@ def scan_sqli(
                     cvss = get_sqli_cvss()
                     logger.warning(
                         f"SQL Injection FOUND in parameter '{param_name}' "
-                        f"with {db_type} database"
+                        f"with {db_type} database — CVSS {cvss['score']} ({cvss['severity']})"
                     )
                     return {
                         'vulnerability_found': True,
-                        'severity': 'HIGH',
+                        'severity': cvss['severity'],
                         'details': (
                             f'SQL Injection in parameter "{param_name}". '
                             f'Database: {db_type}. Payload: {payload!r}. '

@@ -313,6 +313,17 @@ class OWASPScanner:
                 break
 
         # Forced browsing – admin paths (no session cookies)
+        # If the body contains a login form, the app IS protecting the endpoint
+        # correctly (login-in-body pattern) — don't flag as unprotected.
+        LOGIN_BODY_INDICATORS = re.compile(
+            r'(<input[^>]+type=["\']password["\']|'
+            r'<form[^>]+(login|signin|auth)|'
+            r'name=["\']password["\']|'
+            r'id=["\']login|'
+            r'action=["\'][^"\']*login|'
+            r'log\s*in\s*to|please\s*sign\s*in)',
+            re.I
+        )
         base = f"{parsed.scheme}://{parsed.netloc}"
         admin_paths = ['/admin', '/admin/', '/dashboard', '/administrator',
                        '/wp-admin', '/manage', '/console', '/control-panel',
@@ -321,12 +332,20 @@ class OWASPScanner:
             resp = self._get(base + path, allow_redirects=False,
                              extra_headers={'Cookie': ''})
             if resp and resp.status_code == 200:
+                # Skip if body contains login form — endpoint is protected
+                if LOGIN_BODY_INDICATORS.search(resp.text):
+                    logger.debug(f'A01: {path} has login form — skipping FP')
+                    continue
+                # Skip suspiciously small responses (blank stubs / JS redirects)
+                if len(resp.text.strip()) < 200:
+                    continue
                 self.vulnerabilities.append(_vuln(
                     'A01', 'Unprotected Admin Endpoint', 'CRITICAL',
-                    f'"{path}" returned HTTP 200 without authentication.',
+                    f'"{path}" returned HTTP 200 without authentication '
+                    f'and no login form detected in response body.',
                     base + path, 9.1, f'HTTP {resp.status_code}'
                 ))
-                break  # one finding is enough
+                break
 
     # ====================================================================
     # A02 – Cryptographic Failures
@@ -683,15 +702,26 @@ class OWASPScanner:
                 url, 6.5 if severity == 'HIGH' else 5.3, ', '.join(missing)
             ))
 
-        # Server version disclosure
+        # Technology/version disclosure
+        # "Server: nginx" with no version = informational only, skip it.
+        # "Server: nginx/1.14.0" with a version = flag it (CVE lookup possible).
+        VERSION_IN_HEADER = re.compile(r'[/\s][\d]+\.[\d]')
+        ALWAYS_FLAG_HEADERS = ('X-Powered-By', 'X-AspNet-Version',
+                               'X-Generator', 'X-Runtime', 'X-Version')
         for dh in ('Server', 'X-Powered-By', 'X-AspNet-Version', 'X-Generator',
                     'X-Drupal-Cache', 'X-Runtime', 'X-Version'):
-            if dh in headers:
-                self.vulnerabilities.append(_vuln(
-                    'A05', 'Technology Disclosure', 'LOW',
-                    f'Header "{dh}" reveals technology: {headers[dh]}',
-                    url, 3.7, f'{dh}: {headers[dh]}'
-                ))
+            if dh not in headers:
+                continue
+            val = headers[dh]
+            # For Server header: only flag if version number is present
+            if dh == 'Server' and not VERSION_IN_HEADER.search(val):
+                logger.debug(f'A05: {dh}: {val} has no version string, skipping')
+                continue
+            self.vulnerabilities.append(_vuln(
+                'A05', 'Technology Disclosure', 'LOW',
+                f'Header "{dh}" reveals technology/version: {val}',
+                url, 3.7, f'{dh}: {val}'
+            ))
 
         # Dangerous HTTP methods
         for method in self.DANGEROUS_METHODS:
@@ -708,17 +738,40 @@ class OWASPScanner:
                 pass
 
         # Debug / sensitive paths
+        # Require BOTH a meaningful body size AND actual debug content keywords.
+        # 50-byte threshold was too low — any page passes. Raise to 500 and
+        # require debug-specific keywords so normal pages don’t trigger this.
+        DEBUG_CONTENT_PATTERNS = re.compile(
+            r'(environment\s*variables|server\s*variables|phpinfo|'
+            r'php\s+version|loaded\s+extensions|'
+            r'stack\s*trace|traceback|exception\s*details|'
+            r'database\s+url|secret_?key|api_?key\s*=|'
+            r'\.env\s+file|actuator|heapdump|'
+            r'routes\s+cached|app_debug\s*=\s*true)',
+            re.I
+        )
         parsed = urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
         for path in self.DEBUG_PATHS:
             r = self._get(base + path, allow_redirects=False)
-            if r and r.status_code == 200 and len(r.text) > 50:
-                self.vulnerabilities.append(_vuln(
-                    'A05', 'Exposed Debug/Config Endpoint', 'HIGH',
-                    f'"{path}" returned HTTP 200 with {len(r.text)} bytes of content.',
-                    base + path, 7.5, f'HTTP 200, {len(r.text)} bytes'
-                ))
-                break
+            if r and r.status_code == 200 and len(r.text) > 500:
+                if DEBUG_CONTENT_PATTERNS.search(r.text):
+                    self.vulnerabilities.append(_vuln(
+                        'A05', 'Exposed Debug/Config Endpoint', 'HIGH',
+                        f'"{path}" returned HTTP 200 with {len(r.text)} bytes '
+                        f'and debug/config content detected.',
+                        base + path, 7.5, f'HTTP 200, {len(r.text)} bytes'
+                    ))
+                    break
+                else:
+                    # Path exists but no debug content confirmed — report as LOW
+                    self.vulnerabilities.append(_vuln(
+                        'A05', 'Sensitive Path Accessible (Unconfirmed)', 'LOW',
+                        f'"{path}" returned HTTP 200 with {len(r.text)} bytes '
+                        f'but no debug keywords found. Manual review recommended.',
+                        base + path, 3.7, f'HTTP 200, {len(r.text)} bytes'
+                    ))
+                    break
 
         # Directory listing
         dir_url = base + '/'
@@ -805,7 +858,18 @@ class OWASPScanner:
             )
 
         if raw_cookie:
+            # Only flag cookies that look like session/auth cookies.
+            # Analytics, tracking, and preference cookies missing HttpOnly
+            # are much lower risk than session tokens.
+            SESSION_COOKIE_NAMES = re.compile(
+                r'(session|sess|auth|token|jwt|sid|user_?id|'
+                r'phpsessid|jsessionid|aspsessionid|connect\.sid|'
+                r'remember_?me|access_?token|id_?token)',
+                re.I
+            )
             low = raw_cookie.lower()
+            # Check if any cookie looks session-related
+            is_session_cookie = SESSION_COOKIE_NAMES.search(raw_cookie)
             missing_flags = []
             if 'httponly' not in low:
                 missing_flags.append('HttpOnly')
@@ -814,10 +878,13 @@ class OWASPScanner:
             if 'samesite' not in low:
                 missing_flags.append('SameSite')
             if missing_flags:
+                severity = 'MEDIUM' if is_session_cookie else 'LOW'
+                cvss = 5.3 if is_session_cookie else 3.1
+                cookie_type = 'Session cookie' if is_session_cookie else 'Cookie'
                 self.vulnerabilities.append(_vuln(
-                    'A07', 'Insecure Cookie Flags', 'MEDIUM',
-                    f'Session cookie missing: {", ".join(missing_flags)}.',
-                    url, 5.3, f'Missing: {", ".join(missing_flags)}'
+                    'A07', 'Insecure Cookie Flags', severity,
+                    f'{cookie_type} missing: {", ".join(missing_flags)}.',
+                    url, cvss, f'Missing: {", ".join(missing_flags)}'
                 ))
 
         # HTTP Basic Auth over HTTP
@@ -897,23 +964,47 @@ class OWASPScanner:
             url.rstrip('/') + '/nonexistent-path-xyz-12345',
         ]
 
-        stack_trace_patterns = re.compile(
-            r'(traceback|stack trace|at \w+\.\w+\(|exception in thread|'
-            r'debug_mode|werkzeug debugger|laravel debugger|symfony exception|'
-            r'django\.core\.exceptions|rails error|at System\.|NullPointerException)',
+        # High-confidence patterns: framework debugger UIs and actual exception classes.
+        # These are almost never in normal page content.
+        HIGH_CONFIDENCE_PATTERNS = re.compile(
+            r'(werkzeug\s+debugger|laravel\s+debugger|symfony\s+exception|'
+            r'django\.core\.exceptions|rails\s+error\s+page|'
+            r'at\s+\w+\.\w+\.\w+\(\w+\.java:\d+\)|'
+            r'NullPointerException|StackOverflowError|'
+            r'Traceback\s+\(most\s+recent\s+call\s+last\)|'
+            r'Exception\s+in\s+thread\s+.main.)',
             re.I
+        )
+        # Lower-confidence: only flag if HTTP 500 AND keyword present in <pre>/<code> block
+        LOW_CONFIDENCE_PATTERNS = re.compile(
+            r'<(?:pre|code)[^>]*>[^<]*(stack\s*trace|traceback|exception\s+details|'
+            r'debug_mode)[^<]*</(?:pre|code)>',
+            re.I | re.S
         )
 
         for trigger_url in error_triggers:
             resp = self._get(trigger_url)
-            if resp and resp.status_code in (200, 500, 400):
-                m = stack_trace_patterns.search(resp.text)
-                if m:
+            if not resp:
+                continue
+
+            # High-confidence match: flag regardless of status code
+            m = HIGH_CONFIDENCE_PATTERNS.search(resp.text)
+            if m:
+                self.vulnerabilities.append(_vuln(
+                    'A09', 'Verbose Error / Stack Trace Disclosure', 'MEDIUM',
+                    f'Error page leaks framework debug info. Matched: "{m.group(0)}".',
+                    trigger_url, 5.3, m.group(0)[:120]
+                ))
+                return
+
+            # Low-confidence match: only flag on HTTP 500 with keyword in code block
+            if resp.status_code == 500:
+                m2 = LOW_CONFIDENCE_PATTERNS.search(resp.text)
+                if m2:
                     self.vulnerabilities.append(_vuln(
                         'A09', 'Verbose Error / Stack Trace Disclosure', 'MEDIUM',
-                        f'Error page leaks internal stack trace or framework debug info. '
-                        f'Matched: "{m.group(0)}".',
-                        trigger_url, 5.3, m.group(0)[:120]
+                        f'HTTP 500 error page contains stack trace in code block.',
+                        trigger_url, 5.3, m2.group(0)[:120]
                     ))
                     return
 

@@ -8,31 +8,47 @@ from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, send_file
 from scanner.owasp_scanner import OWASPScanner
-from scanner.config import ScannerConfig
 from scanner.report import ScanResult, ScanReportGenerator
 from scanner.logger import setup_logger
+from scanner.database import (
+    init_db, save_scan, save_findings, mark_scan_error,
+    get_all_scans, get_scan, get_findings,
+)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 logger = setup_logger(__name__, level='INFO')
 
-# ── simple in-memory scan store (swap for Redis in prod) ─────────────
+# ── in-memory store for live progress (NOT persisted) ────────────────
+# This only holds running-scan metadata: progress %, current test name,
+# and the live ScanResult objects while the scan is still in flight.
+# Once the scan completes, results are written to SQLite and this entry
+# can be discarded. We keep it around for the session so the UI can
+# still call /results without a DB round-trip for the active tab.
 active_scans: dict = {}
+
 REPORTS_DIR = Path('reports')
 REPORTS_DIR.mkdir(exist_ok=True)
 
-# ── optional API-key auth (set CYBERX_API_KEY env var to enable) ─────
+# ── optional API-key auth ─────────────────────────────────────────────
 API_KEY = os.environ.get('CYBERX_API_KEY', '')
 
 
 def _check_api_key():
     if not API_KEY:
-        return None  # auth disabled
+        return None
     key = request.headers.get('X-API-Key', '')
     if key != API_KEY:
         return jsonify({'error': 'Unauthorized – provide X-API-Key header'}), 401
     return None
+
+
+# ── initialise DB on startup ──────────────────────────────────────────
+# Called once when the module is imported. Safe because init_db uses
+# CREATE TABLE IF NOT EXISTS — running it multiple times is harmless.
+init_db()
+logger.info('Database initialised')
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -66,12 +82,10 @@ def api_scan():
             return jsonify({'error': 'No valid URLs provided'}), 400
 
         timeout  = int(data.get('timeout', 7))
-        mode     = data.get('mode', 'default')   # default | aggressive | stealth
+        mode     = data.get('mode', 'default')
 
-        # Auth material for authenticated scans
         auth_headers = data.get('auth_headers', {})
         auth_cookies = data.get('auth_cookies', {})
-        # Convenience: accept a single "Authorization" Bearer token
         bearer = data.get('bearer_token', '')
         if bearer:
             auth_headers['Authorization'] = f'Bearer {bearer}'
@@ -80,15 +94,20 @@ def api_scan():
             auth_cookies['session'] = session_cookie
 
         scan_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+
+        # 1. Write scan row to DB immediately (status='running')
+        save_scan(scan_id, urls, mode)
+
+        # 2. Seed the in-memory progress tracker for live polling
         active_scans[scan_id] = {
-            'status':       'running',
-            'progress':     0,
-            'urls_count':   len(urls),
-            'completed':    0,
-            'current_test': 'Initialising…',
+            'status':        'running',
+            'progress':      0,
+            'urls_count':    len(urls),
+            'completed':     0,
+            'current_test':  'Initialising…',
             'test_progress': [],
-            'results':      [],
-            'started':      datetime.now().isoformat(),
+            'results':       [],
+            'started':       datetime.now().isoformat(),
         }
 
         thread = threading.Thread(
@@ -111,20 +130,35 @@ def api_scan_status(scan_id):
     if denied:
         return denied
 
+    # Check live memory first (fast path for running scans)
     info = active_scans.get(scan_id)
-    if not info:
+    if info:
+        vulns_found = sum(1 for r in info['results'] if r.vulnerability_found)
+        return jsonify({
+            'scan_id':               scan_id,
+            'status':                info['status'],
+            'progress':              info['progress'],
+            'urls_count':            info['urls_count'],
+            'completed':             info['completed'],
+            'current_test':          info.get('current_test', ''),
+            'test_progress':         info.get('test_progress', []),
+            'vulnerabilities_found': vulns_found,
+        }), 200
+
+    # Fall back to DB for historical scans (server was restarted etc.)
+    scan = get_scan(scan_id)
+    if not scan:
         return jsonify({'error': 'Scan not found'}), 404
 
-    vulns_found = sum(1 for r in info['results'] if r.vulnerability_found)
     return jsonify({
-        'scan_id':           scan_id,
-        'status':            info['status'],
-        'progress':          info['progress'],
-        'urls_count':        info['urls_count'],
-        'completed':         info['completed'],
-        'current_test':      info.get('current_test', ''),
-        'test_progress':     info.get('test_progress', []),
-        'vulnerabilities_found': vulns_found,
+        'scan_id':               scan_id,
+        'status':                scan['status'],
+        'progress':              100,
+        'urls_count':            scan['urls_count'],
+        'completed':             scan['urls_count'],
+        'current_test':          'Loaded from history',
+        'test_progress':         [],
+        'vulnerabilities_found': scan['total_findings'],
     }), 200
 
 
@@ -134,24 +168,46 @@ def api_scan_results(scan_id):
     if denied:
         return denied
 
+    # Try live memory first
     info = active_scans.get(scan_id)
-    if not info:
-        return jsonify({'error': 'Scan not found'}), 404
-    if info['status'] != 'completed':
-        return jsonify({'error': 'Scan still in progress'}), 202
+    if info:
+        if info['status'] == 'error':
+            return jsonify({'error': 'Scan failed: ' + info.get('error', 'unknown')}), 500
+        if info['status'] != 'completed':
+            return jsonify({'error': 'Scan still in progress'}), 202
+        results = [r.to_dict() for r in info['results']]
+    else:
+        # Load from DB — handles history page and post-restart access
+        scan = get_scan(scan_id)
+        if not scan:
+            return jsonify({'error': 'Scan not found'}), 404
+        if scan['status'] == 'error':
+            return jsonify({'error': 'Scan failed'}), 500
+        if scan['status'] != 'completed':
+            return jsonify({'error': 'Scan still in progress'}), 202
+        results = get_findings(scan_id)
 
-    results = [r.to_dict() for r in info['results']]
     return jsonify({
         'scan_id': scan_id,
         'results': results,
         'summary': {
-            'total_findings':   len(results),
-            'critical': sum(1 for r in results if r['severity'] == 'CRITICAL'),
-            'high':     sum(1 for r in results if r['severity'] == 'HIGH'),
-            'medium':   sum(1 for r in results if r['severity'] == 'MEDIUM'),
-            'low':      sum(1 for r in results if r['severity'] == 'LOW'),
+            'total_findings': len(results),
+            'critical': sum(1 for r in results if r.get('severity') == 'CRITICAL'),
+            'high':     sum(1 for r in results if r.get('severity') == 'HIGH'),
+            'medium':   sum(1 for r in results if r.get('severity') == 'MEDIUM'),
+            'low':      sum(1 for r in results if r.get('severity') == 'LOW'),
         },
     }), 200
+
+
+@app.route('/api/history')
+def api_history():
+    """Return list of past scans for the history page."""
+    denied = _check_api_key()
+    if denied:
+        return denied
+    scans = get_all_scans(limit=50)
+    return jsonify({'scans': scans}), 200
 
 
 @app.route('/api/report/<scan_id>/<fmt>')
@@ -160,15 +216,42 @@ def api_download_report(scan_id, fmt):
     if denied:
         return denied
 
+    # Try live memory first, then DB
     info = active_scans.get(scan_id)
-    if not info:
-        return jsonify({'error': 'Scan not found'}), 404
-    if info['status'] != 'completed':
-        return jsonify({'error': 'Scan still in progress'}), 202
-
-    results = info['results']
-    if not results:
-        return jsonify({'error': 'No results'}), 404
+    if info:
+        if info['status'] == 'error':
+            return jsonify({'error': 'Scan failed, no report available'}), 500
+        if info['status'] != 'completed':
+            return jsonify({'error': 'Scan still in progress'}), 202
+        results = info['results']
+        if not results:
+            return jsonify({'error': 'No results'}), 404
+    else:
+        scan = get_scan(scan_id)
+        if not scan:
+            return jsonify({'error': 'Scan not found'}), 404
+        if scan['status'] == 'error':
+            return jsonify({'error': 'Scan failed, no report available'}), 500
+        if scan['status'] != 'completed':
+            return jsonify({'error': 'Scan still in progress'}), 202
+        # Reconstruct ScanResult objects from DB rows for the report generator
+        rows = get_findings(scan_id)
+        if not rows:
+            return jsonify({'error': 'No results'}), 404
+        results = [
+            ScanResult(
+                scan_type=r['scan_type'],
+                target_url=r['target_url'],
+                vulnerability_found=True,
+                severity=r['severity'],
+                details=r['details'],
+                cvss_score=r['cvss_score'],
+                scan_duration=0.0,
+                owasp_category=r['owasp_category'],
+                evidence=r['evidence'],
+            )
+            for r in rows
+        ]
 
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     try:
@@ -236,7 +319,6 @@ def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
                         owasp_category=v.get('owasp_category', ''),
                         evidence=v.get('evidence', ''),
                     ))
-                # brief pause between URLs to be polite
                 time.sleep(0.3)
             except Exception as exc:
                 logger.error(f'Error scanning {url}: {exc}')
@@ -252,15 +334,19 @@ def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
                 ))
 
             active_scans[scan_id]['completed'] = idx + 1
-            active_scans[scan_id]['progress'] = int((idx + 1) / len(urls) * 100)
+            active_scans[scan_id]['progress']  = int((idx + 1) / len(urls) * 100)
 
+        # Update in-memory store
         active_scans[scan_id].update({
             'results':      all_results,
             'status':       'completed',
             'progress':     100,
             'current_test': 'Scan complete ✓',
         })
-        logger.info(f'Scan {scan_id} done – {len(all_results)} findings')
+
+        # Persist to SQLite
+        save_findings(scan_id, all_results)
+        logger.info(f'Scan {scan_id} done – {len(all_results)} findings saved to DB')
 
     except Exception as exc:
         logger.error(f'Fatal scan error {scan_id}: {exc}')
@@ -269,6 +355,7 @@ def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
             'error':        str(exc),
             'current_test': f'Error: {exc}',
         })
+        mark_scan_error(scan_id, str(exc))
 
 
 if __name__ == '__main__':

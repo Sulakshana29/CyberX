@@ -159,7 +159,7 @@ def scan_reflected_xss(
     Returns:
         Dictionary with keys:
             - vulnerability_found (bool): Whether a vulnerability was detected.
-            - severity (str): Severity level (High for reflected XSS).
+            - severity (str): Severity level (HIGH for reflected XSS).
             - details (str): Human-readable description of findings including
                            vulnerable parameter, XSS vector used, and canary.
             - cvss_score (float): CVSS v3.1 score (0-10).
@@ -220,7 +220,7 @@ def scan_reflected_xss(
                     
                     return {
                         'vulnerability_found': True,
-                        'severity': 'High',
+                        'severity': 'HIGH',
                         'details': (
                             f'Reflected XSS vulnerability detected in parameter '
                             f'"{param_name}". Vector: {vector}. '

@@ -1,3 +1,9 @@
-requests==2.31.0
+# Web framework
 flask==2.3.3
 werkzeug==2.3.7
+
+# Production WSGI server (replaces Flask dev server)
+gunicorn==21.2.0
+
+# HTTP client used by scanner modules
+requests==2.31.0
