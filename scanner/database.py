@@ -13,13 +13,15 @@ Usage:
 import os
 import sqlite3
 import json
+import logging
+
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict
 
 DB_PATH = Path(os.environ.get('CYBERX_DB_PATH', 'cyberx.db'))
-
+logger = logging.getLogger(__name__)
 
 # ── connection helper ─────────────────────────────────────────────────
 
@@ -54,8 +56,16 @@ def init_db() -> None:
     """
     with _get_conn() as conn:
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                username        TEXT    UNIQUE NOT NULL,
+                password_hash   TEXT    NOT NULL,
+                role            TEXT    NOT NULL DEFAULT 'guest'
+            );
+
             CREATE TABLE IF NOT EXISTS scans (
                 scan_id       TEXT PRIMARY KEY,
+                user_id       INTEGER REFERENCES users(id),
                 status        TEXT    NOT NULL DEFAULT 'running',
                 mode          TEXT    NOT NULL DEFAULT 'default',
                 urls          TEXT    NOT NULL,          -- JSON array of URLs
@@ -88,20 +98,48 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_scans_started_at
                 ON scans(started_at DESC);
         """)
+        
+        # Safe migration for existing databases
+        try:
+            conn.execute("ALTER TABLE scans ADD COLUMN user_id INTEGER REFERENCES users(id)")
+        except sqlite3.OperationalError as e:
+            # Column already exists
+            pass
 
+
+# ── user operations ───────────────────────────────────────────────────
+
+def get_user(user_id: int) -> Optional[Dict]:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+def get_user_by_username(username: str) -> Optional[Dict]:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    return dict(row) if row else None
+
+def create_user(username: str, password_hash: str, role: str = 'guest') -> int:
+    with _get_conn() as conn:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+                (username, password_hash, role)
+            )
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError("Username already exists")
 
 # ── write operations ──────────────────────────────────────────────────
 
-def save_scan(scan_id: str, urls: List[str], mode: str) -> None:
+def save_scan(scan_id: str, urls: List[str], mode: str, user_id: Optional[int] = None) -> None:
     """Insert a new scan row when the scan is first created."""
     with _get_conn() as conn:
         conn.execute(
             """INSERT INTO scans
-               (scan_id, status, mode, urls, urls_count, started_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (scan_id, 'running', mode,
-             json.dumps(urls), len(urls),
-             datetime.now().isoformat())
+               (scan_id, user_id, status, mode, urls, urls_count, started_at)
+               VALUES (?, ?, 'running', ?, ?, ?, ?)""",
+            (scan_id, user_id, mode, json.dumps(urls), len(urls), datetime.now().isoformat())
         )
 
 
@@ -179,7 +217,7 @@ def mark_scan_error(scan_id: str, error_msg: str) -> None:
 
 # ── read operations ───────────────────────────────────────────────────
 
-def get_all_scans(limit: int = 50) -> List[Dict]:
+def get_all_scans(user_id: Optional[int] = None, limit: int = 50) -> List[Dict]:
     """Return the most recent scans for the history page.
 
     Args:
@@ -189,16 +227,20 @@ def get_all_scans(limit: int = 50) -> List[Dict]:
         List of dicts with scan metadata — no findings included.
     """
     with _get_conn() as conn:
-        rows = conn.execute(
-            """SELECT scan_id, status, mode, urls, urls_count,
-                      started_at, completed_at,
-                      total_findings, critical_count, high_count,
-                      medium_count, low_count
-               FROM scans
-               ORDER BY started_at DESC
-               LIMIT ?""",
-            (limit,)
-        ).fetchall()
+        query = """SELECT scan_id, status, mode, urls, urls_count,
+                          started_at, completed_at,
+                          total_findings, critical_count, high_count,
+                          medium_count, low_count
+                   FROM scans"""
+        params = []
+        if user_id is not None:
+            query += " WHERE user_id = ?"
+            params.append(user_id)
+            
+        query += " ORDER BY started_at DESC LIMIT ?"
+        params.append(limit)
+        
+        rows = conn.execute(query, tuple(params)).fetchall()
     return [dict(r) for r in rows]
 
 

@@ -8,6 +8,9 @@ gunicorn==21.2.0
 # HTTP client used by scanner modules
 requests==2.31.0
 
+# Authentication
+flask-login==0.6.3
+
 # urllib3 pinned explicitly — used directly for InsecureRequestWarning suppression
 urllib3>=1.26.0,<3
 

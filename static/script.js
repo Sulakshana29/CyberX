@@ -9,11 +9,19 @@ const SEV_BG = {
 
 class CyberXUI {
   constructor() {
-    this.scanId      = null;
+    this.scanId      = sessionStorage.getItem('cyberx_active_scan');
     this.pollTimer   = null;
     this.allResults  = [];
     this.activeFilter = 'ALL';
     this._bind();
+
+    if (this.scanId && window.location.pathname === '/') {
+      // Resume polling if we navigate back to the scanner page
+      document.getElementById('configPanel')?.classList.add('hidden');
+      document.getElementById('progressPanel')?.classList.remove('hidden');
+      this.pollTimer = setInterval(() => this.poll(), 1000);
+      this.poll();
+    }
   }
 
   _bind() {
@@ -71,6 +79,7 @@ class CyberXUI {
       }
       const data = await resp.json();
       this.scanId = data.scan_id;
+      sessionStorage.setItem('cyberx_active_scan', this.scanId);
 
       document.getElementById('configPanel')  ?.classList.add('hidden');
       document.getElementById('progressPanel')  .classList.remove('hidden');
@@ -168,6 +177,7 @@ class CyberXUI {
   reset() {
     clearInterval(this.pollTimer);
     this.scanId = null; this.allResults = [];
+    sessionStorage.removeItem('cyberx_active_scan');
     document.getElementById('configPanel')  ?.classList.remove('hidden');
     document.getElementById('progressPanel')  .classList.add('hidden');
     document.getElementById('resultsPanel')   .classList.add('hidden');

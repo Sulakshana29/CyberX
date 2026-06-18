@@ -8,15 +8,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import urllib3
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 from scanner.owasp_scanner import OWASPScanner
 from scanner.report import ScanResult, ScanReportGenerator
 from scanner.logger import setup_logger
 from scanner.database import (
     init_db, save_scan, save_findings, mark_scan_error,
     get_all_scans, get_scan, get_findings,
+    get_user, get_user_by_username, create_user
 )
 
 # Suppress InsecureRequestWarning emitted by requests when verify=False
@@ -24,6 +27,24 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.secret_key = os.environ.get('CYBERX_SECRET_KEY', 'cyberx-super-secret-dev-key')
+
+# ── Authentication ───────────────────────────────────────────────────
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+class User(UserMixin):
+    def __init__(self, user_dict):
+        self.id = user_dict['id']
+        self.username = user_dict['username']
+        self.role = user_dict['role']
+        self.password_hash = user_dict['password_hash']
+
+@login_manager.user_loader
+def load_user(user_id):
+    u = get_user(int(user_id))
+    return User(u) if u else None
 
 # ── Rate limiting ──────────────────────────────────────────────────
 limiter = Limiter(
@@ -117,14 +138,88 @@ logger.info('Scan eviction thread started')
 # ─────────────────────────────────────────────────────────────────────
 
 @app.route('/')
+@login_required
 def index():
     return render_template('index.html')
 
 
 @app.route('/history')
+@login_required
 def history_page():
     """Scan history dashboard."""
     return render_template('history.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+        
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or request.form
+        username = data.get('username')
+        password = data.get('password')
+        
+        user_dict = get_user_by_username(username)
+        if user_dict and check_password_hash(user_dict['password_hash'], password):
+            user = User(user_dict)
+            login_user(user)
+            return jsonify({'success': True}) if request.is_json else redirect(url_for('index'))
+            
+        if request.is_json:
+            return jsonify({'error': 'Invalid credentials'}), 401
+        return render_template('login.html', error='Invalid credentials')
+        
+    return render_template('login.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+        
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or request.form
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not username or not password or len(password) < 6:
+            msg = 'Username required, password min 6 chars.'
+            if request.is_json: return jsonify({'error': msg}), 400
+            return render_template('login.html', error=msg)
+            
+        try:
+            # For this deployed version, everyone defaults to guest to prevent abuse
+            role = 'guest'
+            if username == 'admin': # Convenience for the owner
+                role = 'admin'
+                
+            create_user(username, generate_password_hash(password), role)
+            user_dict = get_user_by_username(username)
+            login_user(User(user_dict))
+            return jsonify({'success': True}) if request.is_json else redirect(url_for('index'))
+        except ValueError:
+            msg = 'Username already taken'
+            if request.is_json: return jsonify({'error': msg}), 409
+            return render_template('login.html', error=msg)
+            
+    return render_template('login.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+
+@app.route('/api/history')
+@login_required
+def api_history():
+    """Return the most recent 50 scans for the history dashboard."""
+    try:
+        scans = get_all_scans(user_id=current_user.id, limit=50)
+        return jsonify({'scans': scans}), 200
+    except Exception as exc:
+        logger.error(f'History fetch error: {exc}')
+        return jsonify({'error': 'Failed to load history'}), 500
 
 
 @app.route('/health')
@@ -134,11 +229,8 @@ def health():
 
 @app.route('/api/scan', methods=['POST'])
 @limiter.limit('10 per minute', error_message='Rate limit exceeded — max 10 scans per minute per IP')
+@login_required
 def api_scan():
-    denied = _check_api_key()
-    if denied:
-        return denied
-
     try:
         data = request.get_json(force=True) or {}
 
@@ -153,6 +245,16 @@ def api_scan():
         urls, url_error = _validate_urls(urls)
         if url_error:
             return jsonify({'error': url_error}), 400
+
+        # Safe-Mode Enforcement
+        if current_user.role != 'admin':
+            safe_targets = ['juice-shop.herokuapp.com', 'httpbin.org']
+            for u in urls:
+                parsed = urlparse(u)
+                if parsed.hostname not in safe_targets:
+                    return jsonify({
+                        'error': f'Guest accounts are restricted to safe targets to prevent abuse. Unauthorised target: {parsed.hostname}. Allowed targets: {", ".join(safe_targets)}'
+                    }), 403
 
         timeout  = int(data.get('timeout', 7))
         mode     = data.get('mode', 'default')
@@ -171,7 +273,7 @@ def api_scan():
         scan_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
 
         # 1. Write scan row to DB immediately (status='running')
-        save_scan(scan_id, urls, mode)
+        save_scan(scan_id, urls, mode, user_id=current_user.id)
 
         # 2. Seed the in-memory progress tracker for live polling
         with _scans_lock:
@@ -203,10 +305,9 @@ def api_scan():
 
 
 @app.route('/api/scan/<scan_id>/status')
+@limiter.exempt
+@login_required
 def api_scan_status(scan_id):
-    denied = _check_api_key()
-    if denied:
-        return denied
 
     # Check live memory first (fast path for running scans)
     with _scans_lock:
@@ -244,10 +345,9 @@ def api_scan_status(scan_id):
 
 
 @app.route('/api/scan/<scan_id>/results')
+@limiter.exempt
+@login_required
 def api_scan_results(scan_id):
-    denied = _check_api_key()
-    if denied:
-        return denied
 
     # Try live memory first
     with _scans_lock:
@@ -284,21 +384,10 @@ def api_scan_results(scan_id):
     }), 200
 
 
-@app.route('/api/history')
-def api_history():
-    """Return list of past scans for the history page."""
-    denied = _check_api_key()
-    if denied:
-        return denied
-    scans = get_all_scans(limit=50)
-    return jsonify({'scans': scans}), 200
-
 
 @app.route('/api/report/<scan_id>/<fmt>')
+@login_required
 def api_download_report(scan_id, fmt):
-    denied = _check_api_key()
-    if denied:
-        return denied
 
     # Try live memory first, then DB
     info = active_scans.get(scan_id)
