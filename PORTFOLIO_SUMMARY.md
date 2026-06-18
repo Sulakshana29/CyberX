@@ -1,237 +1,160 @@
-# CyberScan - Portfolio Project Summary
+# CyberX v2 — Portfolio Project Summary
 
-## 🎓 CV-Ready Production Scanner
+## What It Is
 
-This is a **completely self-contained, enterprise-grade vulnerability detection engine** ready to showcase to employers, security teams, or clients.
-
-## 📦 What's Included
-
-### Core Scanning Modules
-- ✅ `scanner/sql_injection.py` - Advanced SQL injection detection with multi-DBMS support
-- ✅ `scanner/xss.py` - Sophisticated reflected XSS detection using cryptographic canary tokens
-
-### Production Infrastructure
-- ✅ `scanner/config.py` - Configuration management (default/aggressive/stealth profiles)
-- ✅ `scanner/logger.py` - Enterprise logging with file support
-- ✅ `scanner/cvss.py` - CVSS v3.1 vulnerability scoring
-- ✅ `scanner/report.py` - Multi-format reporting (HTML/JSON/CSV)
-- ✅ `scanner/batch.py` - Concurrent batch scanning with thread pooling
-
-### User Interface
-- ✅ `cyberscan_cli.py` - Professional CLI with 15+ command options
-- ✅ `test_scanners.py` - Integration examples and usage demonstrations
-
-### Quality Assurance
-- ✅ `test_cyberscan.py` - 20+ comprehensive unit tests
-- ✅ Full PEP-8 compliance
-- ✅ Extensive docstrings on every function
-- ✅ Type hints throughout
-
-### Documentation
-- ✅ `README.md` - 200+ line professional documentation
-- ✅ This summary document
+CyberX is a full-stack web vulnerability scanner built with Python + Flask.
+It covers all 10 OWASP Top 10 (2021) categories and is deployed as a REST API
+with a real-time web dashboard.
 
 ---
 
-## 🚀 Key Enhancements Made
+## Technical Stack
 
-### 1. **Configuration System**
-```python
-# Three predefined profiles for different scenarios
-config = ScannerConfig.get_default()      # Balanced
-config = ScannerConfig.get_aggressive()   # Thorough (10s timeout, 2 retries)
-config = ScannerConfig.get_stealth()      # Fast (3s timeout, no logging)
+| Layer | Technology |
+|---|---|
+| Backend | Python 3.11+, Flask 2.3 |
+| Scanner Engine | Custom-built (no Nikto/ZAP wrappers) |
+| Database | SQLite with WAL mode (thread-safe concurrent access) |
+| Production server | Gunicorn (multi-worker) |
+| Containerisation | Docker multi-stage build, non-root user, HEALTHCHECK |
+| Deploy config | render.yaml (one-click Render.com deploy) |
+| CI | GitHub Actions — runs on every push |
+
+---
+
+## OWASP Coverage (A01–A10)
+
+| Category | What's Tested |
+|---|---|
+| **A01** Broken Access Control | IDOR detection (21 param patterns), forced-browsing admin paths, robots.txt-augmented path probing |
+| **A02** Cryptographic Failures | HTTP plaintext, invalid TLS cert, missing HSTS |
+| **A03** Injection | Error-based SQLi (GET/POST/headers), time-based blind SQLi (aggressive mode), reflected XSS with HTML-decode bypass, command injection, LDAP injection, NoSQL injection |
+| **A04** Insecure Design | Path traversal (5 encodings), open redirect |
+| **A05** Security Misconfiguration | 6 missing security headers, server version disclosure, dangerous HTTP methods (TRACE/CONNECT/PUT/DELETE with severity tuning), debug endpoints, directory listing |
+| **A06** Vulnerable Components | Version extraction from headers, known-CVE version flagging (Apache/nginx/PHP/ASP.NET) |
+| **A07** Auth Failures | Insecure cookie flags, HTTP Basic over HTTP, default credential probing |
+| **A08** Integrity Failures | Missing Subresource Integrity on CDN scripts/stylesheets |
+| **A09** Logging Failures | Framework debug pages, verbose stack-trace error responses |
+| **A10** SSRF | URL-param injection → localhost + AWS metadata, blind SSRF via timing |
+
+---
+
+## Key Engineering Decisions
+
+### 1. Canary-token XSS detection
+Instead of checking if a payload appears in the response, the scanner injects a
+cryptographically unique token inside each XSS vector and checks that both the
+token AND the raw payload are reflected (handling HTML-entity encoding too).
+This eliminates false positives from coincidental string matches.
+
+### 2. CVSS v3.1 scoring from scratch
+Implements the full CVSS 3.1 base score formula including Scope-Changed impact
+calculation. Not hardcoded numbers — actual metric inputs produce correct scores:
+- Unauthenticated error-based SQLi → **9.8 CRITICAL**
+- Reflected XSS (UI=Required, Scope=Changed) → **6.1 MEDIUM**
+
+### 3. Thread-safe in-memory scan store
+`active_scans` is guarded by `threading.Lock()` with a copy-on-read pattern.
+A background daemon evicts entries older than 1 hour to prevent memory leaks.
+
+### 4. robots.txt-augmented path probing
+Before probing admin and debug paths, the scanner fetches `/robots.txt` and
+adds Disallowed paths to its probe list. These are often hidden for a reason.
+
+### 5. Retry with exponential back-off
+`_get()` and `_post()` retry on `Timeout` exceptions with 0.5s × attempt
+back-off. Configurable via `max_retries` (default 1).
+
+### 6. Aggressive mode adds blind SQLi + link crawling
+- Time-based blind SQLi payloads (MySQL `SLEEP`, PostgreSQL `pg_sleep`, MSSQL `WAITFOR DELAY`)
+- Single-level same-domain link crawler to auto-discover parameterised endpoints
+
+### 7. Rate limiting
+`flask-limiter` limits scan submissions to 10 per minute per IP, with a global
+200/day and 50/hour default. Prevents API abuse in shared deployments.
+
+---
+
+## Production Infrastructure
+
+```
+app.py
+├── Rate limiting      (flask-limiter, 10 scans/min per IP)
+├── URL validation     (scheme + host check before scanning starts)
+├── Thread-safe store  (threading.Lock on all active_scans mutations)
+├── Memory eviction    (background thread, 1-hour TTL)
+├── Error sanitisation (raw tracebacks hidden in production mode)
+└── Scan duration      (accurately measured per-URL, shown in reports)
+
+scanner/owasp_scanner.py
+├── 17 scan checks     (16 default + blind SQLi in aggressive mode)
+├── robots.txt cache   (fetched once per origin, shared across A01+A05)
+├── crawl_links()      (same-domain href extraction, capped at 20 URLs)
+└── Retry logic        (Timeout-specific retry with back-off)
+
+scanner/database.py
+├── WAL mode SQLite    (concurrent readers + background writer)
+├── Bulk INSERT        (executemany for findings)
+└── Indexed queries    (scan_id index on findings, started_at on scans)
 ```
 
-### 2. **Professional Logging**
-- Structured logging with timestamps
-- DEBUG, INFO, WARNING, ERROR levels
-- File logging support (`cyberscan.log`)
-- Real-time scan progress tracking
+---
 
-### 3. **CVSS v3.1 Scoring**
-- Automatic vulnerability scoring
-- Production-standard vector strings
-- Severity classification (CRITICAL/HIGH/MEDIUM/LOW)
+## Test Suite
 
-```
-SQL Injection: 9.8 (CRITICAL)
-Reflected XSS: 8.2 (HIGH)
-```
+18 unit tests — all passing:
 
-### 4. **Batch Scanning Engine**
-- Multi-threaded concurrent processing
-- Configurable worker threads (default: 3)
-- Progress tracking
-- Summary statistics
+| Class | Tests |
+|---|---|
+| `TestSQLInjectionScanner` | URL param extraction, DB fingerprinting (MySQL/PostgreSQL/SQLite), network error handling, CVSS score validation |
+| `TestXSSScanner` | Canary generation, verbatim + escaped reflection detection, CVSS score validation |
+| `TestConfiguration` | All 3 profile modes (default/aggressive/stealth) |
+| `TestReporting` | ScanResult creation, dict serialisation, JSON report generation |
 
-```python
-scanner = BatchScanner(max_workers=5)
-results = scanner.scan_all_vulnerabilities(urls)  # 5x faster
-```
+Run with: `pytest test_cyberscan.py -v`
 
-### 5. **Enterprise Reporting**
-Three export formats:
+---
 
-**HTML Report**
-- Visual severity indicators
-- Dashboard statistics
-- Professional styling
-- Ready for management review
+## API Reference
 
-**JSON Export**
-- Integration-ready structured data
-- Complete metadata
-- API-friendly format
+| Endpoint | Method | Description |
+|---|---|---|
+| `POST /api/scan` | POST | Start a scan. Body: `{urls, timeout, mode, bearer_token, session_cookie}` |
+| `GET /api/scan/<id>/status` | GET | Live progress polling (progress %, current test, vulns found) |
+| `GET /api/scan/<id>/results` | GET | Full findings list with severity summary |
+| `GET /api/report/<id>/<fmt>` | GET | Download report (`html`, `json`, `csv`) |
+| `GET /api/history` | GET | All past scans (last 50) |
+| `GET /health` | GET | Health check for load balancers / Docker HEALTHCHECK |
 
-**CSV Export**
-- Compliance documentation
-- Spreadsheet analysis
-- Audit trails
+---
 
-### 6. **Professional CLI Interface**
+## Deployment
+
+### Docker
 ```bash
-# Single URL
-python cyberscan_cli.py --all --url "http://example.com/search?q=test" --timeout 10 --aggressive
-
-# Batch scanning
-python cyberscan_cli.py --all --batch-file targets.txt --output report.html --workers 5
-
-# Verbose logging
-python cyberscan_cli.py --sqli --url "http://target.com" --verbose --output result.json
+docker build -t cyberx .
+docker run -p 5000:5000 -e CYBERX_API_KEY=your-key cyberx
 ```
 
-### 7. **Comprehensive Testing**
-- Unit tests for all core functionality
-- Mock-based network testing
-- Configuration profile validation
-- Report generation testing
-- 90%+ code coverage
-
-### 8. **Error Resilience**
-- Graceful network error handling
-- Timeout management
-- Malformed response handling
-- Retry logic with exponential backoff
+### Render.com (one-click)
+1. Fork the repo on GitHub
+2. Connect to [render.com](https://render.com)
+3. New → Blueprint → point at your fork (uses `render.yaml`)
+4. Done — Render auto-generates an API key and mounts a persistent disk
 
 ---
 
-## 📊 How It Demonstrates Senior-Level Skills
+## What This Demonstrates for Employers
 
-### Software Architecture
-✅ Modular design with clear separation of concerns  
-✅ Configuration pattern for flexible behavior  
-✅ Factory methods for object creation  
-✅ Strategy pattern for different scan profiles  
-
-### Security Engineering
-✅ Cryptographically secure canary generation  
-✅ Multi-database signature matching  
-✅ Comprehensive error classification  
-✅ False positive prevention mechanisms  
-✅ CVSS standard compliance  
-
-### Production Engineering
-✅ Structured logging infrastructure  
-✅ Exception handling best practices  
-✅ Performance metrics collection  
-✅ Concurrency management  
-✅ Resource pooling  
-
-### Code Quality
-✅ PEP-8 compliant  
-✅ Full type hints  
-✅ Comprehensive docstrings  
-✅ DRY principles  
-✅ SOLID design  
-
-### Testing & Documentation
-✅ 20+ unit tests with mocking  
-✅ Integration test examples  
-✅ 200+ line professional README  
-✅ CLI help system  
-✅ Code examples  
+| Skill | Evidence |
+|---|---|
+| Security engineering | Custom OWASP scanner, CVSS 3.1 implementation, canary-token XSS, blind SQLi |
+| Systems programming | Thread safety, retry logic, WAL-mode SQLite, memory management |
+| API design | RESTful routes, auth headers, rate limiting, structured error responses |
+| DevOps awareness | Dockerfile multi-stage build, GitHub Actions CI, Render deploy config |
+| Code quality | Type hints, docstrings, 18 unit tests, no external scanner dependencies |
+| Accuracy engineering | False positive tuning (PUT/DELETE, SSRF timing, XSS encoding) |
 
 ---
 
-## 💼 Using for Interviews & CV
-
-### In CV Objective
-> "Senior Application Security Engineer specializing in automated vulnerability detection. Developed CyberScan, a production-grade scanning engine detecting SQL injection and XSS with multi-DBMS support, concurrent processing, and enterprise reporting. Features CVSS v3.1 scoring, configurable scanning profiles, and comprehensive test coverage."
-
-### In Portfolio
-1. Share the GitHub repo link
-2. Highlight architecture decisions
-3. Show off the HTML reports
-4. Demonstrate CLI capabilities
-5. Walk through the code quality
-
-### In Technical Interview
-
-**"Tell us about a project that demonstrates your security expertise"**
-
-> "I built CyberScan, a vulnerability detection engine. It's designed for production use with:
-> 
-> - Advanced SQL injection detection across MySQL, PostgreSQL, SQLite, and MSSQL with signature matching
-> - Sophisticated XSS detection using cryptographic canary tokens to prevent false positives
-> - Enterprise architecture: configurable profiles, structured logging, CVSS v3.1 scoring
-> - Batch scanning engine with thread pooling for 5x performance improvement
-> - Multi-format reporting (HTML, JSON, CSV) for different stakeholders
-> - Comprehensive testing with 20+ unit tests
-> - Production-grade error handling and resource management
->
-> The project demonstrates full-stack security engineering from core detection algorithms through reporting."
-
-### Questions It Prepares You For
-1. "How do you prevent false positives in security scanning?"
-   - Answer: Cryptographic canary tokens + verbatim reflection verification
-   
-2. "How do you make security tools performant?"
-   - Answer: Thread pooling, concurrent processing, configurable timeouts
-   
-3. "How would you design a scanning system for multiple databases?"
-   - Answer: Signature matching pattern with database-specific error catalogs
-   
-4. "Walk us through your error handling strategy"
-   - Answer: Graceful degradation, logging, retry logic, timeout management
-
----
-
-## 🎯 Next Steps to Further Enhance
-
-If you want to take it even further:
-
-1. **Authentication Support** - Add HTTP Basic Auth, OAuth token handling
-2. **Proxy Support** - Route through Burp/OWASP ZAP for interception
-3. **Custom Payloads** - User-defined injection vectors
-4. **Rate Limiting** - Adaptive delays between requests
-5. **Plugin System** - Custom scanner module framework
-6. **Database Integration** - Results stored in SQLite/PostgreSQL
-7. **Web UI Dashboard** - Flask/Django frontend for result visualization
-8. **API Endpoints** - RESTful API for remote scanning
-9. **Docker Containerization** - Ready for deployment
-10. **CI/CD Integration** - GitHub Actions automation examples
-
----
-
-## ✨ Summary
-
-**This is a legitimate, production-ready security tool that demonstrates:**
-
-- Enterprise software architecture
-- Security engineering best practices
-- Code quality and testing standards
-- Performance optimization
-- Professional documentation
-- Career-ready code suitable for any organization
-
-**You can confidently show this to:**
-- Employers hiring security engineers
-- Clients needing vulnerability scanning
-- Security teams evaluating tools
-- Technical interviewers
-
----
-
-**CyberScan v1.0.0** - CV-Ready Vulnerability Detection Engine  
-*Professional-grade code. Production-ready implementation. Interview-winning portfolio piece.*
+**CyberX v2.0** — Built by Sulakshana

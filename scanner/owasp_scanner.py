@@ -24,10 +24,14 @@ import re
 import time
 import secrets
 import requests
+import urllib3
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import (
     urljoin, urlparse, parse_qs, urlencode, urlunparse, quote
 )
+
+# Suppress InsecureRequestWarning from requests when verify=False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from scanner.logger import setup_logger
 from scanner.cvss import calculate_cvss_score
@@ -82,6 +86,17 @@ class OWASPScanner:
 
     SQL_PAYLOADS = ["'", '"', "')", '")', "1' OR '1'='1", "' OR 1=1 --",
                     "' OR 'x'='x", "'; DROP TABLE users; --", "1; SELECT SLEEP(2)--"]
+
+    # Time-based blind SQLi payloads: (payload, expected_sleep_seconds)
+    # Used in aggressive mode only — adds ~3s latency per param tested.
+    BLIND_SQL_PAYLOADS: List[Tuple[str, float]] = [
+        ("'; SELECT SLEEP(3)-- -", 3.0),           # MySQL
+        ("'; SELECT pg_sleep(3)-- -", 3.0),        # PostgreSQL
+        ("'; WAITFOR DELAY '0:0:3'-- -", 3.0),     # MSSQL
+        ("1 AND SLEEP(3)-- -", 3.0),               # MySQL (no quote)
+        ("1; SELECT pg_sleep(3)-- -", 3.0),        # PostgreSQL (no quote)
+    ]
+    BLIND_SQL_DELAY_THRESHOLD = 2.5  # seconds — fire if response took this long
 
     # ------------------------------------------------------------------ A03 XSS
     XSS_TEMPLATES = [
@@ -164,18 +179,25 @@ class OWASPScanner:
 
     # ------------------------------------------------------------------
     def __init__(self, timeout: int = 7, auth_headers: Optional[Dict] = None,
-                 auth_cookies: Optional[Dict] = None):
+                 auth_cookies: Optional[Dict] = None, mode: str = 'default',
+                 max_retries: int = 1):
         """
         Args:
             timeout:      HTTP request timeout in seconds.
             auth_headers: Optional dict of auth headers (e.g. Authorization Bearer).
             auth_cookies: Optional dict of session cookies for authenticated scanning.
+            mode:         'default' or 'aggressive'. Aggressive mode enables time-based
+                          blind SQLi checks and single-level link crawling.
+            max_retries:  Number of retries on transient network errors (default 1).
         """
         self.timeout = timeout
+        self.mode = mode
+        self.max_retries = max_retries
         self.auth_headers: Dict = auth_headers or {}
         self.auth_cookies: Dict = auth_cookies or {}
         self.vulnerabilities: List[Dict] = []
         self._progress_cb = None
+        self._robots_cache: Dict[str, List[str]] = {}  # origin -> disallowed paths
 
     # ------------------------------------------------------------------ progress
     def set_progress_callback(self, cb):
@@ -195,25 +217,39 @@ class OWASPScanner:
 
     def _get(self, url: str, allow_redirects: bool = True,
              extra_headers: Optional[Dict] = None) -> Optional[requests.Response]:
-        try:
-            return requests.get(
-                url, timeout=self.timeout, headers=self._headers(extra_headers),
-                cookies=self.auth_cookies, allow_redirects=allow_redirects, verify=False
-            )
-        except Exception as e:
-            logger.debug(f'GET {url} failed: {e}')
-            return None
+        """HTTP GET with automatic retry on transient network errors."""
+        for attempt in range(self.max_retries + 1):
+            try:
+                return requests.get(
+                    url, timeout=self.timeout, headers=self._headers(extra_headers),
+                    cookies=self.auth_cookies, allow_redirects=allow_redirects, verify=False
+                )
+            except requests.exceptions.Timeout:
+                logger.debug(f'GET {url} timed out (attempt {attempt + 1}/{self.max_retries + 1})')
+                if attempt < self.max_retries:
+                    time.sleep(0.5 * (attempt + 1))  # simple back-off: 0.5s, 1.0s, ...
+            except Exception as e:
+                logger.debug(f'GET {url} failed: {e}')
+                break
+        return None
 
     def _post(self, url: str, data: Optional[Dict] = None,
               json_body=None, extra_headers: Optional[Dict] = None) -> Optional[requests.Response]:
-        try:
-            return requests.post(
-                url, timeout=self.timeout, headers=self._headers(extra_headers),
-                cookies=self.auth_cookies, data=data, json=json_body, verify=False
-            )
-        except Exception as e:
-            logger.debug(f'POST {url} failed: {e}')
-            return None
+        """HTTP POST with automatic retry on transient network errors."""
+        for attempt in range(self.max_retries + 1):
+            try:
+                return requests.post(
+                    url, timeout=self.timeout, headers=self._headers(extra_headers),
+                    cookies=self.auth_cookies, data=data, json=json_body, verify=False
+                )
+            except requests.exceptions.Timeout:
+                logger.debug(f'POST {url} timed out (attempt {attempt + 1}/{self.max_retries + 1})')
+                if attempt < self.max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                logger.debug(f'POST {url} failed: {e}')
+                break
+        return None
 
     def _head(self, url: str) -> Optional[requests.Response]:
         try:
@@ -224,6 +260,82 @@ class OWASPScanner:
         except Exception as e:
             logger.debug(f'HEAD {url} failed: {e}')
             return None
+
+    # ------------------------------------------------------------------ robots.txt
+    def _get_disallowed_paths(self, base_url: str) -> List[str]:
+        """Fetch and parse /robots.txt, returning a list of Disallowed paths.
+
+        Disallowed paths are prime targets for security probing — they are
+        explicitly hidden, often because they contain sensitive content.
+        Results are cached per origin so robots.txt is only fetched once per scan.
+        """
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin in self._robots_cache:
+            return self._robots_cache[origin]
+
+        disallowed: List[str] = []
+        try:
+            resp = requests.get(
+                f"{origin}/robots.txt", timeout=min(self.timeout, 5),
+                headers=self._headers(), verify=False
+            )
+            if resp and resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith('disallow:'):
+                        path = line.split(':', 1)[1].strip()
+                        if path and path != '/' and '*' not in path:
+                            disallowed.append(path)
+                logger.debug(f'robots.txt: {len(disallowed)} disallowed paths found at {origin}')
+        except Exception as e:
+            logger.debug(f'robots.txt fetch failed for {origin}: {e}')
+
+        self._robots_cache[origin] = disallowed
+        return disallowed
+
+    # ------------------------------------------------------------------ link crawler
+    def crawl_links(self, url: str, same_domain_only: bool = True) -> List[str]:
+        """Fetch `url` and extract same-domain links that have query parameters.
+
+        Used in aggressive mode to discover additional endpoints to test beyond
+        the user-provided URL. Only follows links one level deep (no recursion).
+
+        Args:
+            url:             Starting URL to crawl.
+            same_domain_only: If True (default), only return links on the same host.
+
+        Returns:
+            De-duplicated list of discovered URLs with query parameters.
+        """
+        resp = self._get(url)
+        if not resp:
+            return []
+
+        parsed_base = urlparse(url)
+        base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+        # Extract href values from <a> tags using a simple regex
+        href_pat = re.compile(r'<a[^>]+href=["\']([^"\'#][^"\']*)["\'\s]', re.I)
+        found: List[str] = []
+        seen: set = {url}
+
+        for href in href_pat.findall(resp.text):
+            # Resolve relative URLs
+            absolute = urljoin(url, href.split('#')[0])
+            parsed = urlparse(absolute)
+
+            if same_domain_only and parsed.netloc != parsed_base.netloc:
+                continue
+            # Only keep URLs that have query parameters (useful for injection tests)
+            if not parsed.query:
+                continue
+            if absolute not in seen:
+                seen.add(absolute)
+                found.append(absolute)
+
+        logger.debug(f'Crawler found {len(found)} parameterised URLs from {url}')
+        return found[:20]  # cap at 20 to avoid runaway scanning
 
     # ------------------------------------------------------------------ URL helpers
     @staticmethod
@@ -280,6 +392,10 @@ class OWASPScanner:
             ('A10 SSRF',                          self._scan_a10),
         ]
 
+        # Aggressive mode: add time-based blind SQLi (significant extra time)
+        if self.mode == 'aggressive':
+            checks.append(('A03 SQLi – Blind (Time-Based)', self._scan_a03_sqli_blind))
+
         for label, fn in checks:
             self._progress(f'{label}: Testing…')
             try:
@@ -298,9 +414,12 @@ class OWASPScanner:
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
 
-        # IDOR – numeric ID params
+        # IDOR – numeric ID params (extended to cover common abbreviated names)
         id_pat = re.compile(
-            r'^(id|user_?id|post_?id|account_?id|record_?id|file_?id|item_?id|order_?id)$', re.I
+            r'^(id|uid|pid|cid|eid|nid|fid|mid|rid|tid|gid|'
+            r'user_?id|post_?id|account_?id|record_?id|file_?id|'
+            r'item_?id|order_?id|product_?id|customer_?id|member_?id|'
+            r'doc_?id|msg_?id|thread_?id|ticket_?id|invoice_?id)$', re.I
         )
         for param, vals in params.items():
             if id_pat.match(param) and vals and vals[0].isdigit():
@@ -313,6 +432,19 @@ class OWASPScanner:
                 break
 
         # Forced browsing – admin paths (no session cookies)
+        # Augment with any Disallowed paths from robots.txt — those are
+        # often hidden for a reason and are prime forced-browsing targets.
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        robots_paths = self._get_disallowed_paths(url)
+        admin_paths = ['/admin', '/admin/', '/dashboard', '/administrator',
+                       '/wp-admin', '/manage', '/console', '/control-panel',
+                       '/superuser', '/backoffice', '/staff', '/internal']
+        # Merge robots.txt disallowed paths, avoiding duplicates
+        seen_paths = set(admin_paths)
+        for rp in robots_paths:
+            if rp not in seen_paths:
+                admin_paths.append(rp)
+                seen_paths.add(rp)
         # If the body contains a login form, the app IS protecting the endpoint
         # correctly (login-in-body pattern) — don't flag as unprotected.
         LOGIN_BODY_INDICATORS = re.compile(
@@ -324,10 +456,6 @@ class OWASPScanner:
             r'log\s*in\s*to|please\s*sign\s*in)',
             re.I
         )
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        admin_paths = ['/admin', '/admin/', '/dashboard', '/administrator',
-                       '/wp-admin', '/manage', '/console', '/control-panel',
-                       '/superuser', '/backoffice', '/staff', '/internal']
         for path in admin_paths:
             resp = self._get(base + path, allow_redirects=False,
                              extra_headers={'Cookie': ''})
@@ -501,6 +629,28 @@ class OWASPScanner:
     # A03 – Reflected XSS
     # ====================================================================
 
+    @staticmethod
+    def _xss_reflected(body: str, canary: str, payload: str) -> bool:
+        """Return True if the canary appears unescaped OR HTML-encoded in the response.
+
+        Browsers will decode HTML entities before executing scripts, so both
+        verbatim reflection and entity-encoded reflection are exploitable.
+        """
+        if canary not in body:
+            return False
+        # Verbatim reflection — payload intact
+        if payload in body:
+            return True
+        # HTML-entity encoded variants
+        encoded_lt = body.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+        if payload in encoded_lt:
+            return True
+        # Unicode / hex encoded opening bracket
+        alt = body.replace('\\x3c', '<').replace('\\u003c', '<')
+        if payload in alt:
+            return True
+        return False
+
     def _scan_a03_xss(self, url: str):
         parsed = urlparse(url)
         params = list(parse_qs(parsed.query).keys()) or ['q', 'search', 'query', 'input', 's']
@@ -516,7 +666,7 @@ class OWASPScanner:
                     test_url = f"{url.split('?')[0]}?{param}={quote(payload)}"
 
                 resp = self._get(test_url)
-                if resp and canary in resp.text and payload in resp.text:
+                if resp and self._xss_reflected(resp.text, canary, payload):
                     self.vulnerabilities.append(_vuln(
                         'A03', 'Reflected XSS', 'HIGH',
                         f'Reflected XSS in param "{param}". '
@@ -530,7 +680,7 @@ class OWASPScanner:
             canary = secrets.token_hex(8)
             payload = f"<script>alert('{canary}')</script>"
             resp = self._post(url, data={field: payload})
-            if resp and canary in resp.text and payload in resp.text:
+            if resp and self._xss_reflected(resp.text, canary, payload):
                 self.vulnerabilities.append(_vuln(
                     'A03', 'Reflected XSS (POST)', 'HIGH',
                     f'POST XSS in field "{field}". Canary "{canary}" reflected.',
@@ -724,16 +874,40 @@ class OWASPScanner:
             ))
 
         # Dangerous HTTP methods
+        # TRACE is always suspicious (reflects request headers — enables XST).
+        # PUT/DELETE are legitimately used by REST APIs, so downgrade to MEDIUM
+        # and only flag when the response body is non-trivial (>100 bytes),
+        # which suggests the server actually processed the request rather than
+        # returning a canned "method not allowed" stub.
         for method in self.DANGEROUS_METHODS:
             try:
                 r = requests.request(method, url, timeout=self.timeout,
                                      headers=self._headers(), verify=False)
                 if r.status_code not in (405, 501, 400, 403):
-                    self.vulnerabilities.append(_vuln(
-                        'A05', f'{method} Method Enabled', 'HIGH',
-                        f'HTTP {method} returned {r.status_code} (expected 405/403).',
-                        url, 7.5, f'HTTP {r.status_code}'
-                    ))
+                    if method == 'TRACE':
+                        # TRACE cross-site tracing — always HIGH
+                        self.vulnerabilities.append(_vuln(
+                            'A05', 'TRACE Method Enabled', 'HIGH',
+                            f'HTTP TRACE returned {r.status_code}. '
+                            f'Enables cross-site tracing (XST) attacks.',
+                            url, 7.5, f'HTTP {r.status_code}'
+                        ))
+                    elif r.status_code in (200, 201, 204) and len(r.text) > 100:
+                        # PUT/DELETE — only flag if body suggests real processing
+                        self.vulnerabilities.append(_vuln(
+                            'A05', f'{method} Method Enabled', 'MEDIUM',
+                            f'HTTP {method} returned {r.status_code} with a non-trivial response '
+                            f'({len(r.text)} bytes). REST APIs may legitimately use this — '
+                            f'verify no unintended data modification is possible.',
+                            url, 5.3, f'HTTP {r.status_code}, {len(r.text)} bytes'
+                        ))
+                    elif method == 'CONNECT':
+                        self.vulnerabilities.append(_vuln(
+                            'A05', 'CONNECT Method Enabled', 'HIGH',
+                            f'HTTP CONNECT returned {r.status_code}. '
+                            f'May enable proxy tunneling abuse.',
+                            url, 7.5, f'HTTP {r.status_code}'
+                        ))
             except Exception:
                 pass
 
@@ -752,7 +926,15 @@ class OWASPScanner:
         )
         parsed = urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
-        for path in self.DEBUG_PATHS:
+        # Augment debug paths with robots.txt Disallow entries (already fetched and cached by A01)
+        extra_robots = self._get_disallowed_paths(url)
+        debug_paths = list(self.DEBUG_PATHS)
+        seen_debug = set(debug_paths)
+        for rp in extra_robots:
+            if rp not in seen_debug:
+                debug_paths.append(rp)
+                seen_debug.add(rp)
+        for path in debug_paths:
             r = self._get(base + path, allow_redirects=False)
             if r and r.status_code == 200 and len(r.text) > 500:
                 if DEBUG_CONTENT_PATTERNS.search(r.text):
@@ -805,11 +987,15 @@ class OWASPScanner:
             'X-Generator':       r'(.+)',
         }
 
-        KNOWN_OLD = {
-            'apache': ('2.2', '2.4.49', '2.4.50'),
-            'nginx':  ('1.12', '1.14', '1.16'),
-            'php':    ('5.', '7.0', '7.1', '7.2'),
-            'asp.net': ('1.', '2.', '3.5'),
+        # KNOWN_OLD: maps tech name -> tuple of version prefixes with known CVEs.
+        # FIX: was accidentally iterating `for old_versions in KNOWN_OLD.get(tech, [])`
+        # which iterates over *characters* of each string, not over the tuple items.
+        # Now correctly iterates over the tuple directly.
+        KNOWN_OLD: Dict[str, Tuple] = {
+            'apache':  ('2.2.', '2.4.49', '2.4.50'),
+            'nginx':   ('1.12.', '1.14.', '1.16.'),
+            'php':     ('5.', '7.0.', '7.1.', '7.2.'),
+            'asp.net': ('1.', '2.', '3.5.'),
         }
 
         for header, pattern in version_headers.items():
@@ -821,11 +1007,9 @@ class OWASPScanner:
                 tech = m.group(1).lower() if m.lastindex and m.lastindex >= 1 else ''
                 version = m.group(2) if m.lastindex and m.lastindex >= 2 else val
 
-                is_old = any(
-                    version.startswith(old)
-                    for old_versions in KNOWN_OLD.get(tech, [])
-                    for old in [old_versions]
-                )
+                # Correctly check each known-old prefix against the extracted version string
+                known_old_prefixes = KNOWN_OLD.get(tech, ())
+                is_old = any(version.startswith(prefix) for prefix in known_old_prefixes)
 
                 if is_old:
                     self.vulnerabilities.append(_vuln(
@@ -1038,13 +1222,51 @@ class OWASPScanner:
                         ))
                         return
 
-                    if elapsed >= self.timeout * 0.85:
+                    # Blind SSRF via timing: require elapsed to be very close to the
+                    # full timeout (within 0.5s) AND the response must be non-empty.
+                    # This avoids false positives on legitimately slow networks.
+                    blind_threshold = max(self.timeout - 0.5, self.timeout * 0.9)
+                    if elapsed >= blind_threshold and resp.text.strip():
                         self.vulnerabilities.append(_vuln(
                             'A10', 'Potential Blind SSRF (Timing)', 'HIGH',
-                            f'Param "{param}" caused {elapsed:.1f}s delay when pointed at {target}.',
+                            f'Param "{param}" caused {elapsed:.1f}s delay when pointed at {target}. '
+                            f'Threshold: {blind_threshold:.1f}s. Manual verification required.',
                             test_url, 8.6, f'{elapsed:.1f}s response time'
                         ))
                         return
+
+    # ====================================================================
+    # A03 – Time-based Blind SQL Injection (aggressive mode)
+    # ====================================================================
+
+    def _scan_a03_sqli_blind(self, url: str):
+        """Time-based blind SQL injection — only run in aggressive mode.
+
+        Injects sleep payloads for MySQL, PostgreSQL, and MSSQL and measures
+        response time. A confirmed delay >= BLIND_SQL_DELAY_THRESHOLD seconds
+        indicates the server executed the injected SQL.
+        """
+        params = parse_qs(urlparse(url).query, keep_blank_values=True)
+        if not params:
+            return
+
+        for param in params:
+            for payload, expected_sleep in self.BLIND_SQL_PAYLOADS:
+                test_url = self._append_get_param(url, param, payload)
+                t0 = time.time()
+                resp = self._get(test_url)
+                elapsed = time.time() - t0
+
+                if resp and elapsed >= self.BLIND_SQL_DELAY_THRESHOLD:
+                    # Confirm: the delay is proportional to what we injected
+                    self.vulnerabilities.append(_vuln(
+                        'A03', 'SQL Injection – Blind (Time-Based)', 'CRITICAL',
+                        f'Blind SQLi in GET param "{param}" with payload {payload!r}. '
+                        f'Response delayed {elapsed:.2f}s (expected ≥{self.BLIND_SQL_DELAY_THRESHOLD}s). '
+                        f'Indicates server-side SQL execution.',
+                        test_url, 9.8, f'{elapsed:.2f}s delay'
+                    ))
+                    return
 
     # ====================================================================
     # Report builder

@@ -3,10 +3,14 @@
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
+import urllib3
 from flask import Flask, render_template, request, jsonify, send_file
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from scanner.owasp_scanner import OWASPScanner
 from scanner.report import ScanResult, ScanReportGenerator
 from scanner.logger import setup_logger
@@ -15,8 +19,19 @@ from scanner.database import (
     get_all_scans, get_scan, get_findings,
 )
 
+# Suppress InsecureRequestWarning emitted by requests when verify=False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+
+# ── Rate limiting ──────────────────────────────────────────────────
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=['200 per day', '50 per hour'],
+    storage_uri='memory://',
+)
 
 logger = setup_logger(__name__, level='INFO')
 
@@ -27,12 +42,19 @@ logger = setup_logger(__name__, level='INFO')
 # can be discarded. We keep it around for the session so the UI can
 # still call /results without a DB round-trip for the active tab.
 active_scans: dict = {}
+_scans_lock = threading.Lock()   # guards all reads/writes of active_scans
+
+# Evict entries that have been completed/errored for more than this long.
+_EVICT_AFTER = timedelta(hours=1)
+_EVICT_INTERVAL = 300  # seconds between eviction sweeps
 
 REPORTS_DIR = Path('reports')
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # ── optional API-key auth ─────────────────────────────────────────────
 API_KEY = os.environ.get('CYBERX_API_KEY', '')
+
+IS_PRODUCTION = os.environ.get('FLASK_DEBUG', '0') != '1'
 
 
 def _check_api_key():
@@ -44,11 +66,50 @@ def _check_api_key():
     return None
 
 
+def _validate_urls(urls: list) -> tuple:
+    """Return (valid_urls, error_message). error_message is None when all OK."""
+    validated = []
+    for raw in urls:
+        parsed = urlparse(raw)
+        if parsed.scheme not in ('http', 'https'):
+            return [], f'Invalid URL (must start with http:// or https://): {raw!r}'
+        if not parsed.netloc:
+            return [], f'Invalid URL (missing host): {raw!r}'
+        validated.append(raw)
+    return validated, None
+
+
+def _evict_old_scans():
+    """Background thread: remove stale completed/errored entries from active_scans."""
+    while True:
+        time.sleep(_EVICT_INTERVAL)
+        cutoff = datetime.now() - _EVICT_AFTER
+        to_delete = []
+        with _scans_lock:
+            for sid, info in active_scans.items():
+                if info['status'] in ('completed', 'error'):
+                    try:
+                        started = datetime.fromisoformat(info['started'])
+                        if started < cutoff:
+                            to_delete.append(sid)
+                    except Exception:
+                        pass
+            for sid in to_delete:
+                del active_scans[sid]
+        if to_delete:
+            logger.info(f'Evicted {len(to_delete)} stale scan(s) from memory')
+
+
 # ── initialise DB on startup ──────────────────────────────────────────
 # Called once when the module is imported. Safe because init_db uses
 # CREATE TABLE IF NOT EXISTS — running it multiple times is harmless.
 init_db()
 logger.info('Database initialised')
+
+# ── start background eviction thread ─────────────────────────────────
+_evict_thread = threading.Thread(target=_evict_old_scans, daemon=True, name='scan-evictor')
+_evict_thread.start()
+logger.info('Scan eviction thread started')
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -60,12 +121,19 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/history')
+def history_page():
+    """Scan history dashboard."""
+    return render_template('history.html')
+
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'healthy', 'version': '2.0.0'}), 200
 
 
 @app.route('/api/scan', methods=['POST'])
+@limiter.limit('10 per minute', error_message='Rate limit exceeded — max 10 scans per minute per IP')
 def api_scan():
     denied = _check_api_key()
     if denied:
@@ -81,8 +149,15 @@ def api_scan():
         if not urls:
             return jsonify({'error': 'No valid URLs provided'}), 400
 
+        # Validate URL format before kicking off any scanning
+        urls, url_error = _validate_urls(urls)
+        if url_error:
+            return jsonify({'error': url_error}), 400
+
         timeout  = int(data.get('timeout', 7))
         mode     = data.get('mode', 'default')
+        if mode not in ('default', 'aggressive'):
+            mode = 'default'
 
         auth_headers = data.get('auth_headers', {})
         auth_cookies = data.get('auth_cookies', {})
@@ -99,16 +174,17 @@ def api_scan():
         save_scan(scan_id, urls, mode)
 
         # 2. Seed the in-memory progress tracker for live polling
-        active_scans[scan_id] = {
-            'status':        'running',
-            'progress':      0,
-            'urls_count':    len(urls),
-            'completed':     0,
-            'current_test':  'Initialising…',
-            'test_progress': [],
-            'results':       [],
-            'started':       datetime.now().isoformat(),
-        }
+        with _scans_lock:
+            active_scans[scan_id] = {
+                'status':        'running',
+                'progress':      0,
+                'urls_count':    len(urls),
+                'completed':     0,
+                'current_test':  'Initialising…',
+                'test_progress': [],
+                'results':       [],
+                'started':       datetime.now().isoformat(),
+            }
 
         thread = threading.Thread(
             target=_run_scan,
@@ -121,7 +197,9 @@ def api_scan():
 
     except Exception as exc:
         logger.error(f'Error starting scan: {exc}')
-        return jsonify({'error': str(exc)}), 500
+        # Never leak raw tracebacks in production — return a generic message
+        msg = str(exc) if not IS_PRODUCTION else 'Internal error starting scan'
+        return jsonify({'error': msg}), 500
 
 
 @app.route('/api/scan/<scan_id>/status')
@@ -131,17 +209,20 @@ def api_scan_status(scan_id):
         return denied
 
     # Check live memory first (fast path for running scans)
-    info = active_scans.get(scan_id)
+    with _scans_lock:
+        info = active_scans.get(scan_id)
+        if info:
+            info_copy = dict(info)
     if info:
-        vulns_found = sum(1 for r in info['results'] if r.vulnerability_found)
+        vulns_found = sum(1 for r in info_copy['results'] if r.vulnerability_found)
         return jsonify({
             'scan_id':               scan_id,
-            'status':                info['status'],
-            'progress':              info['progress'],
-            'urls_count':            info['urls_count'],
-            'completed':             info['completed'],
-            'current_test':          info.get('current_test', ''),
-            'test_progress':         info.get('test_progress', []),
+            'status':                info_copy['status'],
+            'progress':              info_copy['progress'],
+            'urls_count':            info_copy['urls_count'],
+            'completed':             info_copy['completed'],
+            'current_test':          info_copy.get('current_test', ''),
+            'test_progress':         info_copy.get('test_progress', []),
             'vulnerabilities_found': vulns_found,
         }), 200
 
@@ -169,13 +250,16 @@ def api_scan_results(scan_id):
         return denied
 
     # Try live memory first
-    info = active_scans.get(scan_id)
+    with _scans_lock:
+        info = active_scans.get(scan_id)
+        if info:
+            info_copy = dict(info)
     if info:
-        if info['status'] == 'error':
-            return jsonify({'error': 'Scan failed: ' + info.get('error', 'unknown')}), 500
-        if info['status'] != 'completed':
+        if info_copy['status'] == 'error':
+            return jsonify({'error': 'Scan failed: ' + info_copy.get('error', 'unknown')}), 500
+        if info_copy['status'] != 'completed':
             return jsonify({'error': 'Scan still in progress'}), 202
-        results = [r.to_dict() for r in info['results']]
+        results = [r.to_dict() for r in info_copy['results']]
     else:
         # Load from DB — handles history page and post-restart access
         scan = get_scan(scan_id)
@@ -289,23 +373,49 @@ def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
             timeout=timeout,
             auth_headers=auth_headers,
             auth_cookies=auth_cookies,
+            mode=mode,
         )
 
         all_results = []
 
         def _cb(msg):
-            active_scans[scan_id]['current_test'] = msg
-            prog = active_scans[scan_id]['test_progress']
-            if msg not in prog:
-                prog.append(msg)
-            active_scans[scan_id]['test_progress'] = prog[-12:]
+            with _scans_lock:
+                active_scans[scan_id]['current_test'] = msg
+                prog = active_scans[scan_id]['test_progress']
+                if msg not in prog:
+                    prog.append(msg)
+                active_scans[scan_id]['test_progress'] = prog[-12:]
 
         scanner.set_progress_callback(_cb)
 
+        # Aggressive mode: crawl each URL for additional parameterised endpoints
+        if mode == 'aggressive':
+            _cb('Crawling links…')
+            discovered: list = []
+            seen_urls = set(urls)
+            for seed_url in list(urls):
+                try:
+                    found = scanner.crawl_links(seed_url)
+                    for link in found:
+                        if link not in seen_urls:
+                            seen_urls.add(link)
+                            discovered.append(link)
+                except Exception as exc:
+                    logger.debug(f'Crawler error for {seed_url}: {exc}')
+            if discovered:
+                logger.info(f'Crawler discovered {len(discovered)} additional URL(s) to scan')
+                urls = list(urls) + discovered
+                with _scans_lock:
+                    active_scans[scan_id]['urls_count'] = len(urls)
+
         for idx, url in enumerate(urls):
-            active_scans[scan_id]['current_test'] = f'Scanning: {url}'
+
+            with _scans_lock:
+                active_scans[scan_id]['current_test'] = f'Scanning: {url}'
+            url_start = time.time()
             try:
                 raw = scanner.scan_url(url)
+                url_duration = time.time() - url_start
                 for v in raw.get('vulnerabilities', []):
                     sev = v.get('severity', 'MEDIUM')
                     all_results.append(ScanResult(
@@ -315,7 +425,7 @@ def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
                         severity=sev,
                         details=v.get('description', ''),
                         cvss_score=float(v.get('cvss_score', 0.0)),
-                        scan_duration=0.0,
+                        scan_duration=round(url_duration, 3),
                         owasp_category=v.get('owasp_category', ''),
                         evidence=v.get('evidence', ''),
                     ))
@@ -329,20 +439,22 @@ def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
                     severity='MEDIUM',
                     details=str(exc),
                     cvss_score=0.0,
-                    scan_duration=0.0,
+                    scan_duration=round(time.time() - url_start, 3),
                     owasp_category='Error',
                 ))
 
-            active_scans[scan_id]['completed'] = idx + 1
-            active_scans[scan_id]['progress']  = int((idx + 1) / len(urls) * 100)
+            with _scans_lock:
+                active_scans[scan_id]['completed'] = idx + 1
+                active_scans[scan_id]['progress']  = int((idx + 1) / len(urls) * 100)
 
         # Update in-memory store
-        active_scans[scan_id].update({
-            'results':      all_results,
-            'status':       'completed',
-            'progress':     100,
-            'current_test': 'Scan complete ✓',
-        })
+        with _scans_lock:
+            active_scans[scan_id].update({
+                'results':      all_results,
+                'status':       'completed',
+                'progress':     100,
+                'current_test': 'Scan complete ✓',
+            })
 
         # Persist to SQLite
         save_findings(scan_id, all_results)
@@ -350,11 +462,12 @@ def _run_scan(scan_id, urls, timeout, mode, auth_headers, auth_cookies):
 
     except Exception as exc:
         logger.error(f'Fatal scan error {scan_id}: {exc}')
-        active_scans[scan_id].update({
-            'status':       'error',
-            'error':        str(exc),
-            'current_test': f'Error: {exc}',
-        })
+        with _scans_lock:
+            active_scans[scan_id].update({
+                'status':       'error',
+                'error':        str(exc),
+                'current_test': f'Error: {exc}',
+            })
         mark_scan_error(scan_id, str(exc))
 
 
