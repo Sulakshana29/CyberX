@@ -3,14 +3,16 @@ services:
     name: cyberx
     plan: free
     runtime: python
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: "pip install -r requirements.txt && mkdir -p reports"
     startCommand: "gunicorn --workers 2 --bind 0.0.0.0:$PORT --timeout 120 app:app"
     envVars:
       - key: FLASK_DEBUG
         value: "0"
+      - key: CYBERX_SECRET_KEY
+        generateValue: true     # Render auto-generates a secure secret key
       - key: CYBERX_API_KEY
-        generateValue: true     # Render auto-generates a secret
+        generateValue: true     # Render auto-generates an API key
       - key: CYBERX_DB_PATH
-        value: "/opt/render/project/src/cyberx.db"
+        value: "/tmp/cyberx.db"
 
     healthCheckPath: /health
