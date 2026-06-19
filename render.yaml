@@ -11,8 +11,5 @@ services:
         generateValue: true     # Render auto-generates a secret
       - key: CYBERX_DB_PATH
         value: "/opt/render/project/src/cyberx.db"
-    disk:
-      name: cyberx-data
-      mountPath: /opt/render/project/src
-      sizeGB: 1
+
     healthCheckPath: /health
