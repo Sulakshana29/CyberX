@@ -135,5 +135,5 @@ cyberscan.log
 
 # Reports
 reports/
-*.html
 report_*.html
+cyberx_report_*.html

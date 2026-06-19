@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}CyberX - OWASP Vulnerability Scanner{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <div class="brand">
+                <h1>🔒 CyberX</h1>
+                <p>OWASP Top 10 Vulnerability Scanner</p>
+            </div>
+            <ul class="nav-links">
+                <li><a href="/">Scan</a></li>
+                <li><a href="/history">History</a></li>
+                <li><a href="#what-we-test">Coverage</a></li>
+                {% if current_user.is_authenticated %}
+                <li><a href="/logout" style="color: var(--accent-primary);">Logout ({{ current_user.username }})</a></li>
+                {% else %}
+                <li><a href="/login" style="color: var(--accent-primary);">Login</a></li>
+                {% endif %}
+            </ul>
+        </div>
+    </nav>
+
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 CyberX v2.0.0 — For authorised security testing only</p>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

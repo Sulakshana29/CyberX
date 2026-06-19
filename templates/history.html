@@ -1,0 +1,388 @@
+{% extends "base.html" %}
+{% block title %}Scan History – CyberX{% endblock %}
+{% block content %}
+
+<div class="container main-content">
+
+  <section class="hero">
+    <h2>📋 Scan History</h2>
+    <p>All previous scans persisted to database — click a row to expand findings</p>
+  </section>
+
+  <!-- ── Aggregate stats bar ──────────────────────────────────── -->
+  <div id="statsBar" class="history-stats-bar hidden">
+    <div class="hstat-card">
+      <span class="hstat-icon">🔍</span>
+      <div><div class="hstat-num" id="statTotal">0</div><div class="hstat-lbl">Total Scans</div></div>
+    </div>
+    <div class="hstat-card" style="border-color:#00ff88;">
+      <span class="hstat-icon">✅</span>
+      <div><div class="hstat-num" id="statDone" style="color:#00ff88;">0</div><div class="hstat-lbl">Completed</div></div>
+    </div>
+    <div class="hstat-card" style="border-color:#ff4444;">
+      <span class="hstat-icon">💀</span>
+      <div><div class="hstat-num" id="statCrit" style="color:#ff4444;">0</div><div class="hstat-lbl">Critical Findings</div></div>
+    </div>
+    <div class="hstat-card" style="border-color:#ffaa00;">
+      <span class="hstat-icon">⚠️</span>
+      <div><div class="hstat-num" id="statHigh" style="color:#ffaa00;">0</div><div class="hstat-lbl">High Findings</div></div>
+    </div>
+    <div class="hstat-card">
+      <span class="hstat-icon">📊</span>
+      <div><div class="hstat-num" id="statFindings">0</div><div class="hstat-lbl">Total Findings</div></div>
+    </div>
+  </div>
+
+  <!-- ── Loading state ──────────────────────────────────────────── -->
+  <div id="historyLoading" class="history-state-center">
+    <div class="scan-spinner"></div>
+    <p style="color:var(--text-secondary);margin-top:16px;">Loading scan history…</p>
+  </div>
+
+  <!-- ── Empty state ────────────────────────────────────────────── -->
+  <div id="historyEmpty" class="history-state-center hidden">
+    <div style="font-size:64px;margin-bottom:16px;">🔍</div>
+    <h3 style="color:var(--text-primary);margin-bottom:10px;">No scans yet</h3>
+    <p style="color:var(--text-secondary);margin-bottom:24px;">
+      Run your first scan to see results here
+    </p>
+    <a href="/" class="btn btn-primary">▶ Start a Scan</a>
+  </div>
+
+  <!-- ── Error state ────────────────────────────────────────────── -->
+  <div id="historyError" class="history-state-center hidden">
+    <div style="font-size:48px;margin-bottom:16px;">❌</div>
+    <h3 style="color:#ff4444;margin-bottom:10px;">Failed to load history</h3>
+    <p id="historyErrorMsg" style="color:var(--text-secondary);margin-bottom:24px;"></p>
+    <button class="btn btn-secondary" onclick="loadHistory()">↺ Retry</button>
+  </div>
+
+  <!-- ── Scan table ─────────────────────────────────────────────── -->
+  <div id="historyContent" class="hidden">
+
+    <div class="history-toolbar">
+      <span style="color:var(--text-muted);font-size:13px;" id="scanCount"></span>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-secondary" style="padding:8px 16px;font-size:13px;" onclick="loadHistory()">↺ Refresh</button>
+        <a href="/" class="btn btn-primary" style="padding:8px 16px;font-size:13px;">▶ New Scan</a>
+      </div>
+    </div>
+
+    <div class="results-table-container">
+      <table class="results-table history-table">
+        <thead>
+          <tr>
+            <th style="width:36px;"></th>
+            <th>Started</th>
+            <th>Target(s)</th>
+            <th>Mode</th>
+            <th>Status</th>
+            <th style="color:#ff4444;">CRIT</th>
+            <th style="color:#ffaa00;">HIGH</th>
+            <th style="color:#d97706;">MED</th>
+            <th style="color:#00d4ff;">LOW</th>
+            <th>Total</th>
+            <th>Duration</th>
+            <th>Export</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<style>
+  /* ── history-specific styles ── */
+  .history-stats-bar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .hstat-card {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 16px 20px;
+    transition: all .2s;
+  }
+  .hstat-card:hover {
+    border-color: var(--accent-primary);
+    box-shadow: var(--glow-primary);
+  }
+  .hstat-icon { font-size: 24px; }
+  .hstat-num { font-size: 26px; font-weight: 800; color: var(--accent-primary); line-height: 1; }
+  .hstat-lbl { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .06em; margin-top: 3px; }
+
+  .history-state-center {
+    text-align: center;
+    padding: 80px 0;
+  }
+  .scan-spinner {
+    width: 48px; height: 48px;
+    border: 3px solid var(--bg-tertiary);
+    border-top-color: var(--accent-primary);
+    border-radius: 50%;
+    animation: spinH 0.8s linear infinite;
+    margin: 0 auto;
+  }
+  @keyframes spinH { to { transform: rotate(360deg); } }
+
+  .history-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .history-table td, .history-table th { padding: 14px 10px; }
+
+  /* Row expand */
+  .expand-btn {
+    background: none; border: none; color: var(--accent-primary);
+    cursor: pointer; font-size: 18px; padding: 0 4px;
+    transition: transform .2s;
+    line-height: 1;
+  }
+  .expand-btn.open { transform: rotate(90deg); }
+  .detail-row td {
+    padding: 0 !important;
+    background: var(--bg-primary) !important;
+  }
+  .detail-inner {
+    padding: 16px 20px;
+    border-left: 3px solid var(--accent-primary);
+    margin: 6px 12px;
+    border-radius: 4px;
+  }
+  .mini-findings { font-size: 12px; }
+  .mini-findings table { width: 100%; border-collapse: collapse; }
+  .mini-findings th { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing:.05em; padding: 6px 8px; border-bottom: 1px solid var(--border-color); }
+  .mini-findings td { padding: 8px; color: var(--text-secondary); border-bottom: 1px solid var(--border-color); }
+  .mini-findings tr:last-child td { border-bottom: none; }
+  .mini-badge {
+    display: inline-block; padding: 2px 8px;
+    border-radius: 999px; font-size: 10px; font-weight: 700;
+  }
+
+  .hstatus {
+    display: inline-block; padding: 3px 10px;
+    border-radius: 999px; font-size: 11px; font-weight: 700;
+    text-transform: uppercase;
+  }
+  .hstatus-completed { background: rgba(0,255,136,.15); color: #00ff88; }
+  .hstatus-running   { background: rgba(0,212,255,.15); color: #00d4ff; }
+  .hstatus-error     { background: rgba(255,68,68,.15);  color: #ff4444; }
+
+  .export-group { display: flex; gap: 5px; }
+  .xbtn {
+    padding: 4px 9px; border: 1px solid var(--border-color-light);
+    background: transparent; color: var(--text-muted);
+    border-radius: 5px; cursor: pointer; font-size: 11px; font-weight: 600;
+    transition: all .15s;
+  }
+  .xbtn:hover { background: var(--accent-primary); color: var(--bg-primary); border-color: var(--accent-primary); }
+  .xbtn:disabled { opacity: .3; cursor: not-allowed; }
+</style>
+
+<script>
+const HISTORY_SEV_COLOR = {
+  CRITICAL: '#ff4444', HIGH: '#ffaa00', MEDIUM: '#d97706', LOW: '#00d4ff'
+};
+
+function fmtDate(iso) {
+  if (!iso) return '–';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric'})
+    + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function fmtDuration(s, e) {
+  if (!s || !e) return '–';
+  const ms = new Date(e) - new Date(s);
+  if (ms < 0) return '–';
+  const secs = Math.round(ms / 1000);
+  return secs < 60 ? `${secs}s` : `${Math.floor(secs/60)}m ${secs%60}s`;
+}
+
+function sevNum(n, color) {
+  if (!n) return `<span style="color:var(--text-muted)">0</span>`;
+  return `<span style="font-weight:700;color:${color}">${n}</span>`;
+}
+
+function urlsPreview(raw) {
+  let urls = [];
+  try { urls = JSON.parse(raw || '[]'); } catch(_) {}
+  if (!urls.length) return '–';
+  const first = urls[0].length > 42 ? urls[0].substring(0, 42) + '…' : urls[0];
+  const extra = urls.length > 1 ? ` <span style="color:var(--text-muted);font-size:11px;">+${urls.length-1} more</span>` : '';
+  return `<span title="${urls.join('\n')}" style="font-family:monospace;font-size:11px;color:var(--text-secondary)">${first}</span>${extra}`;
+}
+
+function xbtns(scanId, status) {
+  const dis = status !== 'completed' ? 'disabled' : '';
+  return `<div class="export-group">
+    <button class="xbtn" ${dis} onclick="dl('${scanId}','html')">HTML</button>
+    <button class="xbtn" ${dis} onclick="dl('${scanId}','json')">JSON</button>
+    <button class="xbtn" ${dis} onclick="dl('${scanId}','csv')">CSV</button>
+  </div>`;
+}
+
+window.dl = (id, fmt) => window.location.href = `/api/report/${id}/${fmt}`;
+
+// Expand row to show top findings inline
+const expandedRows = new Set();
+async function toggleExpand(scanId, btn) {
+  const detailRow = document.getElementById(`detail-${scanId}`);
+  if (!detailRow) return;
+
+  if (expandedRows.has(scanId)) {
+    expandedRows.delete(scanId);
+    btn.classList.remove('open');
+    detailRow.classList.add('hidden');
+    return;
+  }
+
+  expandedRows.add(scanId);
+  btn.classList.add('open');
+  detailRow.classList.remove('hidden');
+
+  // Lazy-load findings if not already fetched
+  const inner = detailRow.querySelector('.detail-inner');
+  if (inner.dataset.loaded) return;
+  inner.dataset.loaded = '1';
+  inner.innerHTML = `<p style="color:var(--text-muted);font-size:13px;">Loading findings…</p>`;
+
+  try {
+    const r = await fetch(`/api/scan/${scanId}/results`);
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      inner.innerHTML = `<p style="color:#ff4444;font-size:13px;">${e.error || 'Failed to load findings'}</p>`;
+      return;
+    }
+    const d = await r.json();
+    const findings = (d.results || []).slice(0, 10); // top 10 by CVSS
+
+    if (!findings.length) {
+      inner.innerHTML = `<p style="color:var(--text-muted);font-size:13px;">No findings recorded.</p>`;
+      return;
+    }
+
+    inner.innerHTML = `<div class="mini-findings">
+      <table>
+        <thead><tr><th>OWASP</th><th>Type</th><th>Severity</th><th>CVSS</th><th>Details</th></tr></thead>
+        <tbody>
+          ${findings.map(f => {
+            const c = HISTORY_SEV_COLOR[f.severity] || '#8a8d93';
+            return `<tr>
+              <td><strong>${f.owasp_category||'–'}</strong></td>
+              <td>${f.scan_type||'–'}</td>
+              <td><span class="mini-badge" style="background:${c}22;color:${c}">${f.severity}</span></td>
+              <td style="font-weight:700;color:${c}">${f.cvss_score||0}</td>
+              <td style="max-width:340px;font-size:12px">${(f.details||'').substring(0,120)}${f.details?.length>120?'…':''}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      ${findings.length === 10 ? `<p style="font-size:11px;color:var(--text-muted);margin-top:8px">Showing top 10 by CVSS — download full report for all findings</p>` : ''}
+    </div>`;
+  } catch(err) {
+    inner.innerHTML = `<p style="color:#ff4444;font-size:13px;">Error: ${err.message}</p>`;
+  }
+}
+
+async function loadHistory() {
+  document.getElementById('historyLoading').classList.remove('hidden');
+  document.getElementById('historyEmpty').classList.add('hidden');
+  document.getElementById('historyError').classList.add('hidden');
+  document.getElementById('historyContent').classList.add('hidden');
+  document.getElementById('statsBar').classList.add('hidden');
+
+  try {
+    const r = await fetch('/api/history');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    const scans = d.scans || [];
+
+    document.getElementById('historyLoading').classList.add('hidden');
+
+    if (!scans.length) {
+      document.getElementById('historyEmpty').classList.remove('hidden');
+      return;
+    }
+
+    // Compute aggregate stats
+    const total   = scans.length;
+    const done    = scans.filter(s => s.status === 'completed').length;
+    const totC    = scans.reduce((a,s) => a + (s.critical_count||0), 0);
+    const totH    = scans.reduce((a,s) => a + (s.high_count||0),    0);
+    const totF    = scans.reduce((a,s) => a + (s.total_findings||0), 0);
+
+    document.getElementById('statTotal').textContent    = total;
+    document.getElementById('statDone').textContent     = done;
+    document.getElementById('statCrit').textContent     = totC;
+    document.getElementById('statHigh').textContent     = totH;
+    document.getElementById('statFindings').textContent = totF;
+    document.getElementById('statsBar').classList.remove('hidden');
+    document.getElementById('scanCount').textContent    = `Showing ${total} scan${total!==1?'s':''}`;
+
+    // Build table rows
+    document.getElementById('historyBody').innerHTML = scans.map(s => {
+      const statusCls = `hstatus-${s.status}`;
+      const canExpand = s.status === 'completed' && s.total_findings > 0;
+      return `
+        <tr class="${canExpand ? 'expandable-row' : ''}">
+          <td>
+            ${canExpand
+              ? `<button class="expand-btn" id="expbtn-${s.scan_id}" onclick="toggleExpand('${s.scan_id}', this)" title="Show top findings">▶</button>`
+              : ''}
+          </td>
+          <td style="white-space:nowrap;font-size:13px">${fmtDate(s.started_at)}</td>
+          <td>${urlsPreview(s.urls)}</td>
+          <td><span style="font-size:12px;text-transform:capitalize;color:var(--text-secondary)">${s.mode||'default'}</span></td>
+          <td><span class="hstatus ${statusCls}">${s.status}</span></td>
+          <td>${sevNum(s.critical_count, '#ff4444')}</td>
+          <td>${sevNum(s.high_count,     '#ffaa00')}</td>
+          <td>${sevNum(s.medium_count,   '#d97706')}</td>
+          <td>${sevNum(s.low_count,      '#00d4ff')}</td>
+          <td style="font-weight:700;color:var(--text-primary)">${s.total_findings||0}</td>
+          <td style="font-size:12px;color:var(--text-muted)">${fmtDuration(s.started_at, s.completed_at)}</td>
+          <td>${xbtns(s.scan_id, s.status)}</td>
+        </tr>
+        <tr id="detail-${s.scan_id}" class="detail-row hidden">
+          <td colspan="12"><div class="detail-inner"></div></td>
+        </tr>`;
+    }).join('');
+
+    document.getElementById('historyContent').classList.remove('hidden');
+
+  } catch(err) {
+    document.getElementById('historyLoading').classList.add('hidden');
+    document.getElementById('historyErrorMsg').textContent = err.message;
+    document.getElementById('historyError').classList.remove('hidden');
+  }
+}
+
+// Auto-refresh running scans every 5s
+let autoRefreshTimer = null;
+function startAutoRefresh(scans) {
+  const hasRunning = scans.some(s => s.status === 'running');
+  if (hasRunning && !autoRefreshTimer) {
+    autoRefreshTimer = setInterval(loadHistory, 5000);
+  } else if (!hasRunning && autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+}
+
+document.addEventListener('DOMContentLoaded', loadHistory);
+</script>
+{% endblock %}

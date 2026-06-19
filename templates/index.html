@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% block title %}CyberX – OWASP Top 10 Scanner{% endblock %}
+{% block content %}
+
+<div class="container main-content">
+  <section class="hero">
+    <h2>🛡 OWASP Top 10 Scanner</h2>
+    <p>Full A01–A10 coverage · GET/POST/Header injection · Authenticated scanning</p>
+  </section>
+
+  {% if current_user.is_authenticated and current_user.role != 'admin' %}
+  <div style="background: rgba(255, 170, 0, 0.1); border: 1px solid #ffaa00; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; display: flex; align-items: flex-start; gap: 12px;">
+    <span style="font-size: 20px;">⚠️</span>
+    <div>
+      <h4 style="margin: 0 0 4px 0; color: #ffaa00; font-size: 14px;">Guest Account Restrictions</h4>
+      <p style="margin: 0; font-size: 13px; color: var(--text-secondary); line-height: 1.4;">
+        To prevent abuse, public guest accounts are heavily restricted. You may only scan the following authorised practice domains: 
+        <strong style="color:var(--text-primary);">juice-shop.herokuapp.com</strong> and <strong style="color:var(--text-primary);">httpbin.org</strong>.
+      </p>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="scan-interface">
+
+    <!-- ── Config Panel ─────────────────────────────────── -->
+    <div id="configPanel" class="config-panel">
+      <h3>⚙️ Scan Configuration</h3>
+
+      <div class="form-group">
+        <label for="urls">Target URLs</label>
+        <textarea id="urls" rows="5"
+          placeholder="https://example.com/search?q=test&#10;https://example.com/user?id=1"></textarea>
+        <small>One URL per line — include query parameters for injection tests</small>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group half">
+          <label for="timeout">Timeout (s)</label>
+          <input type="number" id="timeout" value="7" min="3" max="60">
+        </div>
+        <div class="form-group half">
+          <label for="mode">Mode</label>
+          <select id="mode">
+            <option value="default">🔍 Standard</option>
+            <option value="aggressive">⚡ Aggressive (10 s)</option>
+            <option value="stealth">🥷 Stealth (3 s)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Auth section -->
+      <div id="authContainer" class="auth-panel-container">
+        <div class="auth-panel-header" onclick="toggleAuthPanel()">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="auth-icon">🔐</span>
+            <div>
+              <h4 style="margin:0; font-size: 15px; color: var(--text-primary);">Authenticated Scan</h4>
+              <p style="margin:0; font-size: 11px; color: var(--text-muted);">Provide credentials to scan behind logins (optional)</p>
+            </div>
+          </div>
+          <span id="authChevron" class="chevron">▼</span>
+        </div>
+        <div id="authPanelBody" class="auth-panel-body hidden">
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="bearerToken">Bearer Token <span style="color:var(--accent-primary);font-size:10px;">(JWT/OAuth)</span></label>
+              <input type="password" id="bearerToken" placeholder="eyJhbGciOiJIUzI1NiIs…">
+              <small>Auto-prefixed with <code>Bearer</code></small>
+            </div>
+            <div class="form-group half">
+              <label for="sessionCookie">Session Cookie <span style="color:var(--accent-primary);font-size:10px;">(session=...)</span></label>
+              <input type="password" id="sessionCookie" placeholder="abc123xyz890...">
+              <small>Passed as the <code>session</code> cookie</small>
+            </div>
+          </div>
+          <div class="form-group" style="margin-top: 16px;">
+            <label for="customHeaders">Custom HTTP Headers <span style="color:var(--accent-primary);font-size:10px;">(JSON format)</span></label>
+            <input type="text" id="customHeaders" placeholder='{"X-API-Key": "your-secret-key"}'>
+            <small>Useful for passing custom auth tokens or alternate cookie names.</small>
+          </div>
+        </div>
+      </div>
+
+      <button id="startScan" class="btn btn-primary btn-large">▶ Start Scan</button>
+    </div>
+
+    <!-- ── Progress Panel ───────────────────────────────── -->
+    <div id="progressPanel" class="progress-panel hidden">
+      <h3>⏳ Scanning – OWASP A01 → A10</h3>
+      <div class="progress-info">
+        <div class="stat-row">
+          <span class="stat-label">Status:</span>
+          <span id="status" class="stat-value running">Initialising…</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Progress:</span>
+          <span id="progressPercent" class="stat-value">0%</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">URLs done:</span>
+          <span id="completed" class="stat-value">0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Findings so far:</span>
+          <span id="vulnsLive" class="stat-value" style="color:#f97316;">0</span>
+        </div>
+      </div>
+
+      <div class="progress-bar">
+        <div id="progressFill" class="progress-fill"></div>
+      </div>
+
+      <div style="margin-top:18px;">
+        <h4 style="color:var(--text-secondary);font-size:11px;text-transform:uppercase;
+                   letter-spacing:.05em;margin-bottom:10px;">Active Tests</h4>
+        <div id="testProgress" style="display:flex;flex-direction:column;gap:6px;">
+          <div class="test-item">⏳ Waiting…</div>
+        </div>
+      </div>
+
+      <div class="action-buttons">
+        <button id="viewResults" class="btn btn-success" style="display:none;">📊 View Results</button>
+        <button id="cancelScan" class="btn btn-secondary">✕ Cancel</button>
+      </div>
+    </div>
+
+  </div><!-- /.scan-interface -->
+
+  <!-- ── Results Panel ──────────────────────────────────── -->
+  <div id="resultsPanel" class="results-panel hidden">
+    <h3>📊 Findings</h3>
+
+    <div class="results-summary">
+      <div class="summary-card"><h4>Total</h4><p id="totalScans" class="number">0</p></div>
+      <div class="summary-card" style="border-color:#dc2626;"><h4 style="color:#dc2626;">CRITICAL</h4><p id="critCount" class="number" style="color:#dc2626;">0</p></div>
+      <div class="summary-card" style="border-color:#ea580c;"><h4 style="color:#ea580c;">HIGH</h4><p id="highCount" class="number" style="color:#ea580c;">0</p></div>
+      <div class="summary-card" style="border-color:#d97706;"><h4 style="color:#d97706;">MEDIUM</h4><p id="medCount" class="number" style="color:#d97706;">0</p></div>
+      <div class="summary-card" style="border-color:#2563eb;"><h4 style="color:#2563eb;">LOW</h4><p id="lowCount" class="number" style="color:#2563eb;">0</p></div>
+    </div>
+
+    <!-- Filter bar -->
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+      <span style="color:var(--text-secondary);font-size:13px;align-self:center;">Filter:</span>
+      <button class="filter-btn active" data-sev="ALL">All</button>
+      <button class="filter-btn" data-sev="CRITICAL">Critical</button>
+      <button class="filter-btn" data-sev="HIGH">High</button>
+      <button class="filter-btn" data-sev="MEDIUM">Medium</button>
+      <button class="filter-btn" data-sev="LOW">Low</button>
+    </div>
+
+    <div class="results-table-container">
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th>OWASP</th>
+            <th>Type</th>
+            <th>URL</th>
+            <th>Severity</th>
+            <th>CVSS</th>
+            <th>Details</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody id="resultsTableBody"></tbody>
+      </table>
+    </div>
+
+    <div class="report-actions">
+      <h4>📥 Export</h4>
+      <div class="button-group">
+        <button id="downloadHTML" class="btn btn-info">📄 HTML</button>
+        <button id="downloadJSON" class="btn btn-info">📋 JSON</button>
+        <button id="downloadCSV"  class="btn btn-info">📊 CSV</button>
+        <button id="newScan"      class="btn btn-secondary">➕ New Scan</button>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /.container -->
+
+<!-- ── Feature grid ──────────────────────────────────────── -->
+<section class="info-section" id="what-we-test">
+  <div class="container">
+    <h3>📚 What CyberX Tests</h3>
+    <div class="features-grid">
+      <div class="feature"><h4>A01 Broken Access Control</h4><p>IDOR, forced browsing, unprotected admin endpoints.</p></div>
+      <div class="feature"><h4>A02 Cryptographic Failures</h4><p>HTTP plaintext, bad TLS certs, missing HSTS.</p></div>
+      <div class="feature"><h4>A03 Injection</h4><p>SQL (GET/POST/Headers), XSS, Command, LDAP, NoSQL injection.</p></div>
+      <div class="feature"><h4>A04 Insecure Design</h4><p>Path traversal, open redirect via URL parameters.</p></div>
+      <div class="feature"><h4>A05 Misconfiguration</h4><p>Missing headers, debug endpoints, dangerous HTTP methods, directory listing.</p></div>
+      <div class="feature"><h4>A06 Vulnerable Components</h4><p>Server/framework version detection and known-old version flagging.</p></div>
+      <div class="feature"><h4>A07 Auth Failures</h4><p>Insecure cookies, Basic Auth over HTTP, default credential probing.</p></div>
+      <div class="feature"><h4>A08 Integrity Failures</h4><p>Missing Subresource Integrity on CDN scripts/styles.</p></div>
+      <div class="feature"><h4>A09 Logging Failures</h4><p>Verbose stack-trace error pages, framework debug screens.</p></div>
+      <div class="feature"><h4>A10 SSRF</h4><p>URL-param injection targeting localhost & AWS metadata; blind SSRF via timing.</p></div>
+      <div class="feature"><h4>🔑 Authenticated Scanning</h4><p>Pass Bearer tokens or session cookies to test behind-login endpoints.</p></div>
+      <div class="feature"><h4>📊 CVSS v3.1 Scoring</h4><p>Every finding carries a CVSS base score for risk prioritisation.</p></div>
+    </div>
+  </div>
+</section>
+
+{% block scripts %}
+<script>
+  const config = { apiBase: '/api' };
+  
+  function toggleAuthPanel() {
+    const container = document.getElementById('authContainer');
+    const body = document.getElementById('authPanelBody');
+    
+    container.classList.toggle('active');
+    
+    if (body.classList.contains('hidden')) {
+      body.classList.remove('hidden');
+    } else {
+      // Add brief delay before hiding to allow CSS animation to finish if we wanted reverse,
+      // but simple hidden toggle is fine with slideDown animation for opening.
+      body.classList.add('hidden');
+    }
+  }
+</script>
+{% endblock %}
+{% endblock %}

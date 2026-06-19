@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Login – CyberX{% endblock %}
+{% block content %}
+
+<div class="container main-content" style="max-width: 450px; margin-top: 60px;">
+  <div class="auth-panel-container active" style="padding: 30px;">
+    
+    <div style="text-align: center; margin-bottom: 24px;">
+      <div style="font-size: 40px; margin-bottom: 10px;">🔐</div>
+      <h2 style="margin: 0; color: var(--text-primary);">CyberX Access</h2>
+      <p style="margin: 5px 0 0 0; font-size: 13px; color: var(--text-muted);">Login or register to access the scanner</p>
+    </div>
+
+    {% if error %}
+    <div style="background: rgba(255, 68, 68, 0.1); border: 1px solid #ff4444; color: #ff4444; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 13px; text-align: center;">
+      {{ error }}
+    </div>
+    {% endif %}
+
+    <!-- Shared Form: Posts to either /login or /register via JS -->
+    <form id="authForm" method="POST" action="/login">
+      <div class="form-group">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" required placeholder="admin or guest">
+      </div>
+      
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required placeholder="••••••••">
+      </div>
+
+      <div style="display: flex; gap: 12px; margin-top: 30px;">
+        <button type="submit" class="btn btn-primary" style="flex: 1; justify-content: center;" onclick="document.getElementById('authForm').action='/login'">Login</button>
+        <button type="submit" class="btn btn-secondary" style="flex: 1; justify-content: center;" onclick="document.getElementById('authForm').action='/register'">Register</button>
+      </div>
+    </form>
+    
+    <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color); font-size: 11px; color: var(--text-muted); text-align: center;">
+      <p style="margin: 0;">Public deployments restrict scanning to safe domains.</p>
+    </div>
+
+  </div>
+</div>
+
+{% endblock %}
