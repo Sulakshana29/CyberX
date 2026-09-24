@@ -110,6 +110,16 @@ class CyberXUI {
         clearInterval(this.pollTimer);
         const vBtn = document.getElementById('viewResults');
         if (vBtn) { vBtn.style.display = ''; }
+        
+        // Auto-transition to results panel after 800ms so it doesn't feel stuck
+        if (!this._transitioning) {
+            this._transitioning = true;
+            document.getElementById('status').textContent = 'Finalising report...';
+            setTimeout(() => {
+                this.showResults();
+                this._transitioning = false;
+            }, 800);
+        }
       }
       if (d.status === 'error') {
         clearInterval(this.pollTimer);
