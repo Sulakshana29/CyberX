@@ -2,14 +2,29 @@
 {% block title %}Login – CyberX{% endblock %}
 {% block content %}
 
-<div class="container main-content" style="max-width: 450px; margin-top: 60px;">
-  <div class="auth-panel-container active" style="padding: 30px;">
+<div class="container main-content" style="max-width: 480px; margin-top: 50px;">
+  <div class="auth-panel-container active" style="padding: 32px;">
     
-    <div style="text-align: center; margin-bottom: 24px;">
-      <div style="font-size: 40px; margin-bottom: 10px;">🔐</div>
-      <h2 style="margin: 0; color: var(--text-primary);">CyberX Access</h2>
-      <p style="margin: 5px 0 0 0; font-size: 13px; color: var(--text-muted);">Login or register to access the scanner</p>
+    <div style="text-align: center; margin-bottom: 28px;">
+      <div style="font-size: 44px; margin-bottom: 12px;">🔒</div>
+      <h2 style="margin: 0; color: var(--text-primary); font-size: 24px;">CyberX Access</h2>
+      <p style="margin: 6px 0 0 0; font-size: 13px; color: var(--text-muted);">Sign in or create an account to start scanning</p>
     </div>
+
+    <!-- Tab switcher -->
+    <div class="auth-tabs" style="display: flex; margin-bottom: 24px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border-color);">
+      <button id="tabLogin" class="auth-tab active" onclick="switchTab('login')" 
+              style="flex:1; padding: 12px; background: var(--accent-primary); color: var(--bg-primary); border: none; cursor: pointer; font-weight: 700; font-size: 14px; transition: all 0.25s ease;">
+        Sign In
+      </button>
+      <button id="tabRegister" class="auth-tab" onclick="switchTab('register')"
+              style="flex:1; padding: 12px; background: var(--bg-tertiary); color: var(--text-secondary); border: none; cursor: pointer; font-weight: 700; font-size: 14px; transition: all 0.25s ease;">
+        Create Account
+      </button>
+    </div>
+
+    <!-- Error / success message -->
+    <div id="authMsg" style="display:none; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 13px; text-align: center;"></div>
 
     {% if error %}
     <div style="background: rgba(255, 68, 68, 0.1); border: 1px solid #ff4444; color: #ff4444; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 13px; text-align: center;">
@@ -17,29 +32,161 @@
     </div>
     {% endif %}
 
-    <!-- Shared Form: Posts to either /login or /register via JS -->
-    <form id="authForm" method="POST" action="/login">
+    <!-- LOGIN FORM -->
+    <form id="loginForm" onsubmit="submitAuth(event, 'login')">
       <div class="form-group">
-        <label for="username">Username</label>
-        <input type="text" id="username" name="username" required placeholder="admin or guest">
+        <label for="loginUsername">Username</label>
+        <input type="text" id="loginUsername" name="username" required placeholder="Your username" autocomplete="username">
       </div>
       
       <div class="form-group">
-        <label for="password">Password</label>
-        <input type="password" id="password" name="password" required placeholder="••••••••">
+        <label for="loginPassword">Password</label>
+        <input type="password" id="loginPassword" name="password" required placeholder="••••••••" autocomplete="current-password">
       </div>
 
-      <div style="display: flex; gap: 12px; margin-top: 30px;">
-        <button type="submit" class="btn btn-primary" style="flex: 1; justify-content: center;" onclick="document.getElementById('authForm').action='/login'">Login</button>
-        <button type="submit" class="btn btn-secondary" style="flex: 1; justify-content: center;" onclick="document.getElementById('authForm').action='/register'">Register</button>
+      <button type="submit" id="loginBtn" class="btn btn-primary" style="width: 100%; justify-content: center; margin-top: 20px; padding: 14px;">
+        <span id="loginBtnText">🔑 Sign In</span>
+      </button>
+    </form>
+
+    <!-- REGISTER FORM -->
+    <form id="registerForm" style="display: none;" onsubmit="submitAuth(event, 'register')">
+      <div class="form-group">
+        <label for="regUsername">Username</label>
+        <input type="text" id="regUsername" name="username" required placeholder="Choose a username" autocomplete="username"
+               minlength="3" pattern="[a-zA-Z0-9_]+" title="Letters, numbers, and underscores only">
       </div>
+      
+      <div class="form-group">
+        <label for="regPassword">Password</label>
+        <input type="password" id="regPassword" name="password" required placeholder="Min 6 characters" autocomplete="new-password"
+               minlength="6">
+      </div>
+
+      <div class="form-group">
+        <label for="regConfirm">Confirm Password</label>
+        <input type="password" id="regConfirm" name="confirm" required placeholder="Re-enter password" autocomplete="new-password"
+               minlength="6">
+      </div>
+
+      <button type="submit" id="registerBtn" class="btn btn-primary" style="width: 100%; justify-content: center; margin-top: 20px; padding: 14px;">
+        <span id="registerBtnText">🚀 Create Account</span>
+      </button>
     </form>
     
     <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color); font-size: 11px; color: var(--text-muted); text-align: center;">
-      <p style="margin: 0;">Public deployments restrict scanning to safe domains.</p>
+      <p style="margin: 0;">CyberX – For authorised security testing only.</p>
     </div>
 
   </div>
 </div>
 
+{% block scripts %}
+<script>
+  function switchTab(tab) {
+    const loginTab = document.getElementById('tabLogin');
+    const regTab = document.getElementById('tabRegister');
+    const loginForm = document.getElementById('loginForm');
+    const regForm = document.getElementById('registerForm');
+    const msg = document.getElementById('authMsg');
+    msg.style.display = 'none';
+
+    if (tab === 'login') {
+      loginTab.style.background = 'var(--accent-primary)';
+      loginTab.style.color = 'var(--bg-primary)';
+      regTab.style.background = 'var(--bg-tertiary)';
+      regTab.style.color = 'var(--text-secondary)';
+      loginForm.style.display = 'block';
+      regForm.style.display = 'none';
+    } else {
+      regTab.style.background = 'var(--accent-primary)';
+      regTab.style.color = 'var(--bg-primary)';
+      loginTab.style.background = 'var(--bg-tertiary)';
+      loginTab.style.color = 'var(--text-secondary)';
+      loginForm.style.display = 'none';
+      regForm.style.display = 'block';
+    }
+  }
+
+  function showMsg(text, isError) {
+    const msg = document.getElementById('authMsg');
+    msg.textContent = text;
+    msg.style.display = 'block';
+    if (isError) {
+      msg.style.background = 'rgba(255, 68, 68, 0.1)';
+      msg.style.border = '1px solid #ff4444';
+      msg.style.color = '#ff4444';
+    } else {
+      msg.style.background = 'rgba(0, 255, 136, 0.1)';
+      msg.style.border = '1px solid #00ff88';
+      msg.style.color = '#00ff88';
+    }
+  }
+
+  async function submitAuth(e, mode) {
+    e.preventDefault();
+    const msg = document.getElementById('authMsg');
+    msg.style.display = 'none';
+
+    let username, password;
+    const btn = mode === 'login' ? document.getElementById('loginBtn') : document.getElementById('registerBtn');
+    const btnText = mode === 'login' ? document.getElementById('loginBtnText') : document.getElementById('registerBtnText');
+    const origText = btnText.textContent;
+
+    if (mode === 'login') {
+      username = document.getElementById('loginUsername').value.trim();
+      password = document.getElementById('loginPassword').value;
+    } else {
+      username = document.getElementById('regUsername').value.trim();
+      password = document.getElementById('regPassword').value;
+      const confirm = document.getElementById('regConfirm').value;
+      
+      if (password !== confirm) {
+        showMsg('Passwords do not match', true);
+        return;
+      }
+      if (password.length < 6) {
+        showMsg('Password must be at least 6 characters', true);
+        return;
+      }
+      if (username.length < 3) {
+        showMsg('Username must be at least 3 characters', true);
+        return;
+      }
+    }
+
+    if (!username || !password) {
+      showMsg('Please fill in all fields', true);
+      return;
+    }
+
+    btn.disabled = true;
+    btnText.textContent = mode === 'login' ? '⏳ Signing in…' : '⏳ Creating account…';
+
+    try {
+      const url = mode === 'login' ? '/login' : '/register';
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      
+      const data = await resp.json().catch(() => ({}));
+      
+      if (resp.ok && data.success) {
+        showMsg(mode === 'login' ? 'Login successful! Redirecting…' : 'Account created! Redirecting…', false);
+        setTimeout(() => window.location.href = '/', 500);
+      } else {
+        showMsg(data.error || 'Something went wrong. Please try again.', true);
+        btn.disabled = false;
+        btnText.textContent = origText;
+      }
+    } catch (err) {
+      showMsg('Network error — please check your connection.', true);
+      btn.disabled = false;
+      btnText.textContent = origText;
+    }
+  }
+</script>
+{% endblock %}
 {% endblock %}

@@ -34,6 +34,13 @@ login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
 
+@login_manager.unauthorized_handler
+def unauthorized():
+    """Return 401 JSON for AJAX requests, redirect for browser navigation."""
+    if request.is_json or request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+        return jsonify({'error': 'Authentication required — please log in'}), 401
+    return redirect(url_for('login'))
+
 class User(UserMixin):
     def __init__(self, user_dict):
         self.id = user_dict['id']
@@ -181,16 +188,19 @@ def register():
         username = data.get('username')
         password = data.get('password')
         
-        if not username or not password or len(password) < 6:
-            msg = 'Username required, password min 6 chars.'
+        if not username or len(username) < 3:
+            msg = 'Username must be at least 3 characters.'
+            if request.is_json: return jsonify({'error': msg}), 400
+            return render_template('login.html', error=msg)
+        if not password or len(password) < 6:
+            msg = 'Password must be at least 6 characters.'
             if request.is_json: return jsonify({'error': msg}), 400
             return render_template('login.html', error=msg)
             
         try:
-            # For this deployed version, everyone defaults to guest to prevent abuse
-            role = 'guest'
-            if username == 'admin': # Convenience for the owner
-                role = 'admin'
+            # All users get admin role — this is a portfolio project, not a public SaaS.
+            # Scanning should be unrestricted for anyone who registers.
+            role = 'admin'
                 
             create_user(username, generate_password_hash(password), role)
             user_dict = get_user_by_username(username)
@@ -246,15 +256,9 @@ def api_scan():
         if url_error:
             return jsonify({'error': url_error}), 400
 
-        # Safe-Mode Enforcement
-        if current_user.role != 'admin':
-            safe_targets = ['juice-shop.herokuapp.com', 'httpbin.org']
-            for u in urls:
-                parsed = urlparse(u)
-                if parsed.hostname not in safe_targets:
-                    return jsonify({
-                        'error': f'Guest accounts are restricted to safe targets to prevent abuse. Unauthorised target: {parsed.hostname}. Allowed targets: {", ".join(safe_targets)}'
-                    }), 403
+        # Note: Domain restrictions removed — this is a portfolio/self-hosted tool.
+        # All authenticated users can scan any target they have authorisation to test.
+        # For public deployments, re-enable safe-target enforcement here.
 
         timeout  = int(data.get('timeout', 7))
         mode     = data.get('mode', 'default')

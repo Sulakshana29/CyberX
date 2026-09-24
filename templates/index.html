@@ -8,18 +8,8 @@
     <p>Full A01–A10 coverage · GET/POST/Header injection · Authenticated scanning</p>
   </section>
 
-  {% if current_user.is_authenticated and current_user.role != 'admin' %}
-  <div style="background: rgba(255, 170, 0, 0.1); border: 1px solid #ffaa00; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; display: flex; align-items: flex-start; gap: 12px;">
-    <span style="font-size: 20px;">⚠️</span>
-    <div>
-      <h4 style="margin: 0 0 4px 0; color: #ffaa00; font-size: 14px;">Guest Account Restrictions</h4>
-      <p style="margin: 0; font-size: 13px; color: var(--text-secondary); line-height: 1.4;">
-        To prevent abuse, public guest accounts are heavily restricted. You may only scan the following authorised practice domains: 
-        <strong style="color:var(--text-primary);">juice-shop.herokuapp.com</strong> and <strong style="color:var(--text-primary);">httpbin.org</strong>.
-      </p>
-    </div>
-  </div>
-  {% endif %}
+
+
 
   <div class="scan-interface">
 
