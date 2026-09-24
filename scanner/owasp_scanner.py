@@ -530,6 +530,9 @@ class OWASPScanner:
         if not params:
             return
 
+        baseline_resp = self._get(url)
+        baseline_text = baseline_resp.text.lower() if baseline_resp else ""
+
         for param in params:
             for payload in self.SQL_PAYLOADS:
                 test_url = self._append_get_param(url, param, payload)
@@ -538,13 +541,14 @@ class OWASPScanner:
                     hit = self._sql_hit(resp.text)
                     if hit:
                         db, sig = hit
-                        self.vulnerabilities.append(_vuln(
-                            'A03', 'SQL Injection (GET)', 'CRITICAL',
-                            f'SQLi in GET param "{param}" with payload {payload!r}. '
-                            f'DB fingerprint: {db}. Matched: "{sig}".',
-                            test_url, 9.8, sig
-                        ))
-                        return
+                        if sig.lower() not in baseline_text:
+                            self.vulnerabilities.append(_vuln(
+                                'A03', 'SQL Injection (GET)', 'CRITICAL',
+                                f'SQLi in GET param "{param}" with payload {payload!r}. '
+                                f'DB fingerprint: {db}. Matched: "{sig}".',
+                                test_url, 9.8, sig
+                            ))
+                            return
 
     # ====================================================================
     # A03 – SQL Injection (POST body)
@@ -560,6 +564,9 @@ class OWASPScanner:
                          'query', 'q', 'id', 'name', 'input', 'data', 'value',
                          'comment', 'message', 'title', 'content', 'filter']
 
+        baseline_resp = self._get(url)
+        baseline_text = baseline_resp.text.lower() if baseline_resp else ""
+
         for field in common_fields:
             for payload in self.SQL_PAYLOADS[:4]:  # keep POST tests lean
                 data = {field: payload}
@@ -568,13 +575,14 @@ class OWASPScanner:
                     hit = self._sql_hit(resp.text)
                     if hit:
                         db, sig = hit
-                        self.vulnerabilities.append(_vuln(
-                            'A03', 'SQL Injection (POST body)', 'CRITICAL',
-                            f'SQLi in POST field "{field}" with payload {payload!r}. '
-                            f'DB fingerprint: {db}. Matched: "{sig}".',
-                            url, 9.8, sig
-                        ))
-                        return
+                        if sig.lower() not in baseline_text:
+                            self.vulnerabilities.append(_vuln(
+                                'A03', 'SQL Injection (POST body)', 'CRITICAL',
+                                f'SQLi in POST field "{field}" with payload {payload!r}. '
+                                f'DB fingerprint: {db}. Matched: "{sig}".',
+                                url, 9.8, sig
+                            ))
+                            return
 
         # Also try JSON body (REST APIs)
         for payload in self.SQL_PAYLOADS[:3]:
@@ -585,13 +593,14 @@ class OWASPScanner:
                 hit = self._sql_hit(resp.text)
                 if hit:
                     db, sig = hit
-                    self.vulnerabilities.append(_vuln(
-                        'A03', 'SQL Injection (JSON body)', 'CRITICAL',
-                        f'SQLi in JSON body with payload {payload!r}. '
-                        f'DB fingerprint: {db}.',
-                        url, 9.8, sig
-                    ))
-                    return
+                    if sig.lower() not in baseline_text:
+                        self.vulnerabilities.append(_vuln(
+                            'A03', 'SQL Injection (JSON body)', 'CRITICAL',
+                            f'SQLi in JSON body with payload {payload!r}. '
+                            f'DB fingerprint: {db}.',
+                            url, 9.8, sig
+                        ))
+                        return
 
     # ====================================================================
     # A03 – SQL Injection (HTTP headers)
@@ -666,7 +675,7 @@ class OWASPScanner:
                     test_url = f"{url.split('?')[0]}?{param}={quote(payload)}"
 
                 resp = self._get(test_url)
-                if resp and self._xss_reflected(resp.text, canary, payload):
+                if resp and 'text/html' in resp.headers.get('Content-Type', '').lower() and self._xss_reflected(resp.text, canary, payload):
                     self.vulnerabilities.append(_vuln(
                         'A03', 'Reflected XSS', 'HIGH',
                         f'Reflected XSS in param "{param}". '
@@ -680,7 +689,7 @@ class OWASPScanner:
             canary = secrets.token_hex(8)
             payload = f"<script>alert('{canary}')</script>"
             resp = self._post(url, data={field: payload})
-            if resp and self._xss_reflected(resp.text, canary, payload):
+            if resp and 'text/html' in resp.headers.get('Content-Type', '').lower() and self._xss_reflected(resp.text, canary, payload):
                 self.vulnerabilities.append(_vuln(
                     'A03', 'Reflected XSS (POST)', 'HIGH',
                     f'POST XSS in field "{field}". Canary "{canary}" reflected.',
