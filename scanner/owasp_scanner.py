@@ -423,12 +423,27 @@ class OWASPScanner:
         )
         for param, vals in params.items():
             if id_pat.match(param) and vals and vals[0].isdigit():
-                self.vulnerabilities.append(_vuln(
-                    'A01', 'Potential IDOR', 'HIGH',
-                    f'Parameter "{param}={vals[0]}" is a direct object reference. '
-                    f'Verify access control prevents horizontal/vertical privilege escalation.',
-                    url, 7.5, f'param={param}&value={vals[0]}'
-                ))
+                baseline_resp = self._get(url)
+                baseline_len = len(baseline_resp.text) if baseline_resp else 0
+                test_id = int(vals[0]) + 1
+                test_url = self._inject_get_param(url, param, str(test_id))
+                test_resp = self._get(test_url)
+                
+                # Check if the endpoint responds differently to ID+1 without an obvious error or identical response
+                if test_resp and test_resp.status_code == 200:
+                    test_len = len(test_resp.text)
+                    if baseline_len > 0 and abs(test_len - baseline_len) > 100:
+                        self.vulnerabilities.append(_vuln(
+                            'A01', 'IDOR (Access Control)', 'HIGH',
+                            f'Parameter "{param}" access control bypass detected (ID={vals[0]} vs {test_id}).',
+                            url, 7.5, f'param={param}&value={vals[0]}'
+                        ))
+                    else:
+                        self.vulnerabilities.append(_vuln(
+                            'A01', 'Potential IDOR', 'INFO',
+                            f'Parameter "{param}" uses a sequential ID. Ensure proper authorization is enforced.',
+                            url, 0.0, f'param={param}&value={vals[0]}'
+                        ))
                 break
 
         # Forced browsing – admin paths (no session cookies)
@@ -463,6 +478,12 @@ class OWASPScanner:
                 # Skip if body contains login form — endpoint is protected
                 if LOGIN_BODY_INDICATORS.search(resp.text):
                     logger.debug(f'A01: {path} has login form — skipping FP')
+                    continue
+                # Skip SPAs or client side routing catch-all index.html
+                if '<div id="root">' in resp.text or '<div id="app">' in resp.text or '<script>window.__NEXT_DATA__' in resp.text:
+                    continue
+                # Skip JS meta redirects
+                if '<meta http-equiv="refresh"' in resp.text.lower() or 'window.location' in resp.text:
                     continue
                 # Skip suspiciously small responses (blank stubs / JS redirects)
                 if len(resp.text.strip()) < 200:
@@ -1212,6 +1233,10 @@ class OWASPScanner:
         if not candidates:
             return
 
+        baseline_t0 = time.time()
+        self._get(url)
+        baseline_elapsed = time.time() - baseline_t0
+
         for param in candidates:
             for target in self.SSRF_TARGETS:
                 test_url = self._inject_get_param(url, param, target)
@@ -1235,10 +1260,10 @@ class OWASPScanner:
                     # full timeout (within 0.5s) AND the response must be non-empty.
                     # This avoids false positives on legitimately slow networks.
                     blind_threshold = max(self.timeout - 0.5, self.timeout * 0.9)
-                    if elapsed >= blind_threshold and resp.text.strip():
+                    if elapsed >= blind_threshold and elapsed > (baseline_elapsed + 3.0) and resp.text.strip():
                         self.vulnerabilities.append(_vuln(
                             'A10', 'Potential Blind SSRF (Timing)', 'HIGH',
-                            f'Param "{param}" caused {elapsed:.1f}s delay when pointed at {target}. '
+                            f'Param "{param}" caused {elapsed:.1f}s delay (baseline {baseline_elapsed:.1f}s) when pointed at {target}. '
                             f'Threshold: {blind_threshold:.1f}s. Manual verification required.',
                             test_url, 8.6, f'{elapsed:.1f}s response time'
                         ))
@@ -1259,6 +1284,10 @@ class OWASPScanner:
         if not params:
             return
 
+        baseline_t0 = time.time()
+        self._get(url)
+        baseline_elapsed = time.time() - baseline_t0
+
         for param in params:
             for payload, expected_sleep in self.BLIND_SQL_PAYLOADS:
                 test_url = self._append_get_param(url, param, payload)
@@ -1266,7 +1295,7 @@ class OWASPScanner:
                 resp = self._get(test_url)
                 elapsed = time.time() - t0
 
-                if resp and elapsed >= self.BLIND_SQL_DELAY_THRESHOLD:
+                if resp and elapsed >= self.BLIND_SQL_DELAY_THRESHOLD and elapsed > (baseline_elapsed + expected_sleep - 1.0):
                     # Confirm: the delay is proportional to what we injected
                     self.vulnerabilities.append(_vuln(
                         'A03', 'SQL Injection – Blind (Time-Based)', 'CRITICAL',
